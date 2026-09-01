@@ -1,0 +1,6 @@
+.cache
+.gocache
+dist
+testdata
+vendor
+*.ps1

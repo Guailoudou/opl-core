@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>OPL Core</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand"><span class="brand-mark">OPL</span><span><strong>OpenP2P Launcher</strong><small>Core Web Console</small></span></div>
+      <nav id="navigation">
+        <button class="nav-item active" data-page="tunnels">隧道</button>
+        <button class="nav-item" data-page="network">OpenP2P 组网</button>
+        <button class="nav-item" data-page="logs">日志</button>
+        <button class="nav-item" data-page="notices">公告</button>
+        <button class="nav-item" data-page="settings">设置</button>
+        <button class="nav-item" data-page="about">关于</button>
+      </nav>
+      <div class="core-summary"><span id="coreDot" class="status-dot neutral"></span><span><strong id="coreStatus">正在连接 Core</strong><small id="coreVersion">v2.0.0</small></span></div>
+    </aside>
+
+    <main class="workspace">
+      <header class="mobile-header"><button id="menuButton" class="icon-button" aria-label="打开导航">☰</button><strong>OPL Core</strong><span id="mobileCoreDot" class="status-dot neutral"></span></header>
+      <div id="alert" class="alert" role="alert" aria-live="assertive" hidden></div>
+
+      <section id="page-tunnels" class="page active" aria-labelledby="tunnelsTitle">
+        <div class="page-heading"><div><h1 id="tunnelsTitle">隧道管理</h1><p>创建和管理 OpenP2P TCP、UDP 隧道。</p></div><button id="newTunnel" class="primary">新建连接</button></div>
+        <div class="toolbar card">
+          <label class="inline-field"><span>本机 UID</span><input id="localUid" readonly aria-label="本机 UID"><button id="copyUid">复制</button></label>
+          <label class="compact-field"><span>共享带宽</span><span class="input-suffix"><input id="shareBandwidth" type="number" min="0" max="100000" inputmode="numeric"><em>Mbps</em></span></label>
+          <button id="quickAdd">快速添加</button>
+        </div>
+        <div id="tunnelList" class="tunnel-list" aria-live="polite"></div>
+        <div id="tunnelEmpty" class="empty-state card"><strong>还没有隧道</strong><p>点击“新建连接”，或使用联机码快速添加。</p></div>
+        <div class="action-bar card">
+          <div class="action-group"><button id="exportCode">导出连接码</button><button id="hostCode">生成联机码</button><button id="disableAll">关闭所有隧道</button></div>
+          <button id="toggleP2P" class="primary wide">启动</button>
+        </div>
+      </section>
+
+      <section id="page-network" class="page" aria-labelledby="networkTitle">
+        <div class="page-heading"><div><h1 id="networkTitle">OpenP2P 虚拟组网</h1><p>端口与设备密钥自动管理，支持游戏局域网广播和组播发现。</p></div></div>
+        <div class="two-column">
+          <article class="card panel"><h2>创建网络</h2><p class="muted">邀请码长期有效，除非主动废除。后续设备可以随时加入。</p>
+            <label><span>当前邀请码</span><span class="field-action"><input id="roomInvite" readonly><button id="copyInvite">复制</button></span></label>
+            <div class="button-row"><button id="hostToggle" class="primary">创建 / 启动网络</button><button id="joinPermission" disabled>暂停加入</button><button id="rotateInvite" disabled>废除邀请码</button></div>
+            <div class="section-heading"><h3>成员</h3><span id="memberCount" class="badge">0</span></div><div id="memberList" class="member-list"></div><p id="memberEmpty" class="muted">暂无成员</p>
+          </article>
+          <article class="card panel"><h2>加入网络</h2>
+            <label><span>联机码</span><input id="joinInvite" autocomplete="off" placeholder="粘贴 OPL2 邀请码"></label>
+            <label><span>本机显示名称（可选）</span><input id="deviceName" maxlength="64" placeholder="例如：客厅电脑"></label>
+            <p class="muted">本机设备身份会自动保留，虚拟 IP 由房主分配。</p><button id="joinToggle" class="primary full">加入网络</button>
+          </article>
+        </div>
+        <article class="card network-status-card">
+          <div class="network-summary"><span id="networkDot" class="status-dot neutral large"></span><div><h2>组网状态</h2><p id="networkStatus">未连接</p></div><label class="ip-field"><span>虚拟 IP</span><span class="field-action"><input id="virtualIp" readonly><button id="copyVirtualIp">复制</button></span></label></div>
+          <div id="networkError" class="inline-error" role="status" hidden></div>
+          <div class="metrics"><span>接收 <strong id="totalRx">0 B</strong></span><span>发送 <strong id="totalTx">0 B</strong></span><span>发现接收 <strong id="relayAccepted">0</strong></span><span>发现转发 <strong id="relayForwarded">0</strong></span><span>丢弃 <strong id="relayDropped">0</strong></span></div>
+          <div class="table-wrap"><table><thead><tr><th>设备</th><th>UID / 公钥</th><th>虚拟 IP</th><th>状态</th><th>下行</th><th>上行</th><th></th></tr></thead><tbody id="deviceTable"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="page-logs" class="page" aria-labelledby="logsTitle"><div class="page-heading"><div><h1 id="logsTitle">运行日志</h1><p>显示 Core、OpenP2P 和本次 Web 控制台的运行记录。</p></div><div class="button-row"><button id="refreshLogs">刷新</button><button id="copyLogs">复制日志</button><button id="clearLogs">清空显示</button></div></div><pre id="logOutput" class="card log-output" tabindex="0"></pre></section>
+
+      <section id="page-notices" class="page" aria-labelledby="noticesTitle"><div class="page-heading"><div><h1 id="noticesTitle">公告</h1><p>沿用 OpenP2P Launcher 公告数据源。</p></div><button id="refreshNotices">刷新</button></div><div id="notices" class="notice-list"><div class="card">正在获取公告…</div></div></section>
+
+      <section id="page-settings" class="page" aria-labelledby="settingsTitle"><div class="page-heading"><div><h1 id="settingsTitle">设置</h1><p>管理 Web 访问网卡、访问限制、OpenP2P 节点和控制台外观。</p></div></div><article class="card panel"><h2>Web 管理访问</h2><p class="muted">Core 只监听选中的 IPv4 网卡。切换后页面会自动转到新的局域网地址。</p><div class="form-grid"><label><span>可访问网卡</span><select id="managementInterface"><option>正在读取网卡…</option></select></label><label><span>当前管理地址</span><span class="field-action"><input id="managementUrl" readonly><button id="copyManagementUrl">复制</button></span></label></div><div class="button-row"><button id="saveManagementInterface" class="primary">应用网卡</button></div><label><span>允许访问的客户端 IPv4</span><textarea id="allowedClientIps" rows="4" spellcheck="false" placeholder="每行填写一个 IPv4 地址"></textarea></label><p class="muted">每行一个地址。默认允许本机所有局域网 IPv4；127.0.0.1 和当前管理网卡地址会始终保留。</p><button id="saveAllowedClientIps">保存访问限制</button></article><div class="two-column settings-columns"><article class="card panel"><h2>连接节点</h2><p class="muted">参与者必须使用相同节点，建议仅在主节点不可用时切换。</p><label><span>服务器</span><select id="serverSelect"><option>正在获取节点…</option></select></label></article><article class="card panel"><h2>外观</h2><label><span>应用主题</span><select id="themeSelect"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label><label><span>强调色</span><input id="accentColor" type="color" value="#2563eb"></label></article></div><article class="card panel danger-zone"><h2>Core 维护</h2><p>关闭网页不会停止后台 Core。Windows 可通过右下角托盘图标重新打开页面或退出 Core。</p><button id="shutdown" class="danger">关闭 Core</button></article></section>
+
+      <section id="page-about" class="page" aria-labelledby="aboutTitle"><div class="page-heading"><div><h1 id="aboutTitle">关于 OpenP2P Launcher</h1><p>独立 Core 与 Web 控制台。</p></div><div class="button-row"><a class="button" href="https://blog.gldhn.top/2024/04/19/opl_ui/" target="_blank" rel="noopener">帮助文档</a><a class="button" href="https://space.bilibili.com/496960407" target="_blank" rel="noopener">作者主页</a><a class="button" href="https://github.com/Guailoudou/opl-core" target="_blank" rel="noopener">GitHub</a></div></div><div class="about-grid"><article class="card panel"><h2>更新日志</h2><pre id="updateLog">联网获取中…</pre></article><article class="card panel"><h2>鸣谢</h2><pre id="thanks">联网获取中…</pre><small>基于 OpenP2P · 内容联网获取</small></article></div></section>
+    </main>
+  </div>
+
+  <dialog id="tunnelDialog"><form id="tunnelForm" method="dialog"><div class="dialog-heading"><div><h2 id="tunnelDialogTitle">添加隧道</h2><p>带 * 的项目为必填项</p></div><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div><input id="tunnelIndex" type="hidden"><label><span>名称</span><input id="tunnelName" maxlength="64" value="自定义" required></label><label><span>UID *</span><input id="tunnelUid" maxlength="64" required></label><div class="form-grid"><label><span>远程端口 *</span><input id="remotePort" type="number" min="1" max="65535" required></label><label><span>本地端口 *</span><input id="localPort" type="number" min="1" max="65535" required></label></div><label><span>协议 *</span><select id="tunnelProtocol"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><label><span>使用预设</span><select id="presetSelect"><option value="">不使用预设</option></select></label><p id="presetNote" class="muted"></p><div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button id="saveTunnel" type="submit" class="primary">添加隧道</button></div></form></dialog>
+  <dialog id="textDialog"><form method="dialog"><div class="dialog-heading"><div><h2 id="textDialogTitle">快速添加</h2><p id="textDialogHelp"></p></div><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div><label><span id="textDialogLabel">联机码</span><textarea id="textDialogInput"></textarea></label><div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button id="textDialogConfirm" type="button" class="primary">确认</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

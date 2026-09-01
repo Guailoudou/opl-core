@@ -1,0 +1,25 @@
+{
+  "openp2p": {
+    "version": "3.25.11",
+    "commit": "232fb31200c4d9de6ce7ea8ca54d28d7a504f893",
+    "embedded": true,
+    "license": "MIT",
+    "source": "https://github.com/openp2p-cn/openp2p/commit/232fb31200c4d9de6ce7ea8ca54d28d7a504f893"
+  },
+  "wintun": {
+    "version": "0.14.1",
+    "sha256": {
+      "386": "d694fa46ab4cfebcb2632d094c7aa97278eef2f8052438621766d863ae98a931",
+      "amd64": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+      "arm64": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
+    },
+    "license": "Wintun prebuilt binaries license",
+    "source": "https://www.wintun.net/builds/wintun-0.14.1.zip"
+  },
+  "wireguardGo": {
+    "version": "v0.0.0-20250505130535-9eb3221f1de5",
+    "commit": "9eb3221f1de589e5dd6a1721fdd7dc0fde0eb10b",
+    "license": "MIT",
+    "source": "https://git.zx2c4.com/wireguard-go/commit/?id=9eb3221f1de589e5dd6a1721fdd7dc0fde0eb10b"
+  }
+}

@@ -1,0 +1,93 @@
+name: Build, release and Pages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: 1.20.14, cache: false}
+      - run: go test -mod=vendor ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: windows, goarch: '386', label: windows-386, ext: .exe, wintun: x86, wintun_sha256: d694fa46ab4cfebcb2632d094c7aa97278eef2f8052438621766d863ae98a931}
+          - {goos: windows, goarch: amd64, label: windows-amd64, ext: .exe, wintun: amd64, wintun_sha256: e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce}
+          - {goos: windows, goarch: arm64, label: windows-arm64, ext: .exe, wintun: arm64, wintun_sha256: f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80}
+          - {goos: linux, goarch: '386', label: linux-386, ext: ''}
+          - {goos: linux, goarch: amd64, label: linux-amd64, ext: ''}
+          - {goos: linux, goarch: arm64, label: linux-arm64, ext: ''}
+          - {goos: linux, goarch: mips, label: linux-mips, ext: ''}
+          - {goos: linux, goarch: mips64, label: linux-mips64, ext: ''}
+          - {goos: darwin, goarch: amd64, label: darwin-amd64, ext: ''}
+          - {goos: darwin, goarch: arm64, label: darwin-arm64, ext: ''}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: 1.20.14, cache: false}
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p "out/opl-core-${{ matrix.label }}"
+          go build -mod=vendor -trimpath -ldflags='-s -w' -o "out/opl-core-${{ matrix.label }}/opl-core${{ matrix.ext }}" ./cmd/opl-core
+          cp -r web "out/opl-core-${{ matrix.label }}/web"
+          cp README.md release-components.json internal/openp2pengine/NOTICE.md "out/opl-core-${{ matrix.label }}/"
+          while IFS= read -r file; do printf '\n===== %s =====\n' "$file"; cat "$file"; done < <(find vendor -type f \( -name 'LICENSE*' -o -name 'COPYING*' -o -name 'NOTICE*' \) | sort) > "out/opl-core-${{ matrix.label }}/THIRD-PARTY-NOTICES.txt"
+      - name: Add Wintun
+        if: matrix.goos == 'windows'
+        run: |
+          curl --fail --location --silent --show-error https://www.wintun.net/builds/wintun-0.14.1.zip -o /tmp/wintun.zip
+          unzip -q /tmp/wintun.zip -d /tmp/wintun
+          cp "/tmp/wintun/wintun/bin/${{ matrix.wintun }}/wintun.dll" "out/opl-core-${{ matrix.label }}/"
+          echo "${{ matrix.wintun_sha256 }}  out/opl-core-${{ matrix.label }}/wintun.dll" | sha256sum --check
+      - name: Package
+        run: |
+          cd out
+          if [ "${{ matrix.goos }}" = windows ]; then zip -qr "opl-core-${{ matrix.label }}.zip" "opl-core-${{ matrix.label }}"; else tar czf "opl-core-${{ matrix.label }}.tar.gz" "opl-core-${{ matrix.label }}"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opl-core-${{ matrix.label }}
+          path: out/opl-core-${{ matrix.label }}.*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: opl-core-*, path: release, merge-multiple: true}
+      - uses: softprops/action-gh-release@v2
+        with: {files: 'release/*'}
+
+  pages:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: {path: web}
+      - id: deployment
+        uses: actions/deploy-pages@v4
