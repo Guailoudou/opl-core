@@ -3,19 +3,12 @@ package device
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
 func TestFixedAndTemporaryKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "device.secret")
 	first, err := LoadOrCreate(path, true)
-	if runtime.GOOS != "windows" {
-		if err == nil {
-			t.Fatal("fixed key unexpectedly stored without a platform backend")
-		}
-		return
-	}
 	if err != nil {
 		t.Fatal(err)
 	}

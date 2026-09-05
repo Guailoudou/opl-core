@@ -102,6 +102,7 @@ func RunWithServices(input io.Reader, output io.Writer, platform string, service
 	if services.Rooms == nil {
 		return errors.New("room service is required")
 	}
+	previous, _ := json.Marshal(services.Rooms.Snapshot())
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	writer := &protocolWriter{encoder: encoder}
@@ -115,7 +116,6 @@ func RunWithServices(input io.Reader, output io.Writer, platform string, service
 		defer eventWG.Done()
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
-		previous, _ := json.Marshal(services.Rooms.Snapshot())
 		for {
 			select {
 			case <-ticker.C:

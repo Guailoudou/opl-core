@@ -1,0 +1,26 @@
+{
+  "invite": {
+    "fixedRoomKey": true,
+    "hostUID": "0123456789abcdef",
+    "pairPort": 25673,
+    "roomKeyHex": "000102030405060708090a0b",
+    "encoded": "OPL2.AQEjRWeJq83vZEkAAQIDBAUGBwgJCgs_FMSY"
+  },
+  "pairing": {
+    "roomKeyText": "room-key-123",
+    "hostPublicKeySHA256Of": "host",
+    "clientPublicKeySHA256Of": "client",
+    "serverNonceByte": 1,
+    "clientNonceByte": 2,
+    "clientName": "玩家一",
+    "assignedIP": "10.0.23.2",
+    "prefixLength": 24,
+    "wireGuardPort": 25674,
+    "discoveryRelayPort": 25675,
+    "leaseRevision": 1,
+    "requestMACHex": "ad80b72f890795293da494f12fa5811811a4f3daa6fe668376ba087e433a104b",
+    "resultMACHex": "2382f522f1204054656963171995649dd1189f81e0c9f8903c2121c4a0fdd2c5",
+    "pskHex": "7d6418a046ae5001403840d7c11b815fb90547e83a1dbea0d8f6a746da62d681",
+    "ackHex": "f0eb8c057254ed358bd41753fd85fefcaefb19ea046cc05e67ee350b43b6b294"
+  }
+}
