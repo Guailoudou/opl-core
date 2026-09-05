@@ -14,13 +14,16 @@ let servers = [];
 let management = null;
 let p2pBusy = '';
 let roomBusy = '';
-let joinBusy = false;
+let joinBusy = '';
+let coreReady = false;
+let savingApps = false;
+let joinOperation = 0;
 let draggedIndex = -1;
 
 const errorText = {
   INVALID_INVITE: '邀请码无效或已损坏。', UNSUPPORTED_PROTOCOL: '邀请码协议版本不受支持，请更新双方程序。',
   AUTH_FAILED: '邀请码已失效或认证失败。', JOIN_DISABLED: '房主已暂停新成员加入。', ROOM_FULL: '房间地址已用完。',
-  MEMBER_DISABLED: '该设备已被房主移除。', PAIR_PORT_IN_USE: '配对端口已被占用。',
+  MEMBER_DISABLED: '该用户已被房主加入黑名单。', PAIR_PORT_IN_USE: '配对端口已被占用。',
   OPENP2P_NOT_READY: 'OpenP2P 网络尚未就绪，Core 会继续重试。', WIREGUARD_FAILED: '虚拟网卡启动失败，请确认管理员权限和驱动完整。',
   WIREGUARD_UPDATE_FAILED: '虚拟网络成员更新失败。', SECRET_STORE_FAILED: '密钥安全存储失败，请检查当前用户权限。',
   CONFIG_WRITE_FAILED: '配置保存失败，Core 已保留上一份有效配置。', INVALID_STATE: '当前状态不允许此操作。',
@@ -28,10 +31,12 @@ const errorText = {
 };
 
 function connect() {
+  coreReady = false;
+  setCoreConnection('connecting');
   const target = location.protocol === 'file:' ? '127.0.0.1:26780' : location.host;
   socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${target}/ws`);
   socket.onopen = async () => {
-    setCoreConnection(true);
+    setCoreConnection('initializing');
     log('Web 控制台已连接 Core');
     try {
       const [nextState, nextConfig, nextManagement] = await Promise.all([call('core.getState'), call('config.get'), call('management.get')]);
@@ -39,19 +44,23 @@ function connect() {
       config = nextConfig;
       management = nextManagement;
       apps = nextState.tunnels || nextConfig.Apps || [];
+      coreReady = true;
       render();
+      setCoreConnection('ready');
       if (management.address === '127.0.0.1' && management.interfaces.length > 1 && !localStorage.getItem('opl-management-interface-prompted')) {
         localStorage.setItem('opl-management-interface-prompted', '1');
         document.querySelector('[data-page="settings"]').click();
         toast('请选择用于访问 Web 控制台的局域网网卡');
       }
       await loadInvite();
-    } catch (error) { showError(error); }
+    } catch (error) { showError(error); socket.close(); }
   };
   socket.onclose = () => {
-    setCoreConnection(false);
+    coreReady = false;
     for (const item of pending.values()) item.reject(new Error('Core 连接已断开'));
     pending.clear();
+    if (state) render();
+    setCoreConnection('reconnecting');
     setTimeout(connect, 2000);
   };
   socket.onmessage = event => {
@@ -87,10 +96,16 @@ function call(method, params, timeout = 15000) {
   });
 }
 
-function setCoreConnection(connected) {
-  $('coreStatus').textContent = connected ? 'Core 已连接' : 'Core 未连接';
-  $('coreDot').className = `status-dot ${connected ? 'success' : 'danger'}`;
+function setCoreConnection(status) {
+  const labels = {connecting: '正在连接 Core', initializing: 'Core 已连接，正在初始化', ready: 'Core 已连接', reconnecting: 'Core 已断开，正在重连'};
+  const label = labels[status];
+  $('coreStatus').textContent = label;
+  $('connectionStatus').textContent = label;
+  $('coreDot').className = `status-dot ${status === 'ready' ? 'success' : status === 'reconnecting' ? 'danger' : 'warning'}`;
   $('mobileCoreDot').className = $('coreDot').className;
+  if (!coreReady) {
+    for (const id of ['shareBandwidth', 'newTunnel', 'quickAdd', 'disableAll', 'toggleP2P', 'exportCode', 'hostCode', 'copyUid', 'hostToggle', 'joinPermission', 'rotateInvite', 'copyInvite', 'joinInvite', 'deviceName', 'joinToggle', 'refreshLogs', 'managementInterface', 'saveManagementInterface', 'allowedClientIps', 'saveAllowedClientIps', 'serverSelect', 'shutdown']) $(id).disabled = true;
+  }
 }
 
 function render() {
@@ -99,6 +114,8 @@ function render() {
   renderTunnels();
   renderNetwork();
   renderManagement();
+  $('refreshLogs').disabled = !coreReady;
+  $('shutdown').disabled = !coreReady;
 }
 
 function renderManagement() {
@@ -112,6 +129,9 @@ function renderManagement() {
   $('managementInterface').value = management.address;
   $('managementUrl').value = management.url;
   if (document.activeElement !== $('allowedClientIps')) $('allowedClientIps').value = (management.allowedIPs || []).join('\n');
+  for (const id of ['managementInterface', 'saveManagementInterface', 'allowedClientIps', 'saveAllowedClientIps']) $(id).disabled = !coreReady;
+  $('serverSelect').disabled = !coreReady || !servers.length;
+  $('copyManagementUrl').disabled = !$('managementUrl').value;
 }
 
 function renderService() {
@@ -124,7 +144,7 @@ function renderService() {
 
 function renderTunnels() {
   const activeNetwork = state.room.running || ['connecting', 'retrying', 'connected'].includes(state.joinState);
-  const locked = state.openP2PRunning || activeNetwork || !!p2pBusy;
+  const locked = !coreReady || savingApps || state.openP2PRunning || activeNetwork || !!p2pBusy;
   $('localUid').value = config?.Network?.Node || '';
   $('shareBandwidth').value = config?.Network?.ShareBandwidth ?? 10;
   if (config && servers.length) $('serverSelect').value = String(Math.max(0, servers.findIndex(item => item.ServerHost === config.Network.ServerHost)));
@@ -132,11 +152,21 @@ function renderTunnels() {
   $('newTunnel').disabled = locked;
   $('quickAdd').disabled = locked;
   $('disableAll').disabled = locked || !apps.some(app => app.Enabled === 1);
-  $('toggleP2P').disabled = activeNetwork || !!p2pBusy;
+  $('exportCode').disabled = locked;
+  $('hostCode').disabled = locked;
+  $('toggleP2P').disabled = !coreReady || activeNetwork || !!p2pBusy;
+  $('toggleP2P').toggleAttribute('aria-busy', !!p2pBusy);
   $('toggleP2P').textContent = p2pBusy === 'stopping' ? '关闭中…' : p2pBusy === 'starting' ? '启动中…' : state.openP2PRunning ? '关闭' : '启动';
   $('tunnelEmpty').hidden = apps.length !== 0;
   const statuses = new Map((state.tunnelStates || []).map(item => [`${item.protocol}:${item.srcPort}`, item]));
   $('tunnelList').replaceChildren(...apps.map((app, index) => tunnelCard(app, index, statuses.get(`${app.Protocol}:${app.SrcPort}`), locked)));
+  $('copyUid').disabled = !$('localUid').value;
+  $('saveTunnel').disabled = locked;
+  $('saveTunnel').toggleAttribute('aria-busy', savingApps);
+  $('saveTunnel').textContent = savingApps ? '保存中…' : Number($('tunnelIndex').value) >= 0 ? '保存更改' : '添加隧道';
+  $('textDialogConfirm').disabled = !coreReady || savingApps;
+  $('textDialogConfirm').toggleAttribute('aria-busy', savingApps);
+  $('textDialogConfirm').textContent = savingApps ? '保存中…' : '确认';
 }
 
 function tunnelCard(app, index, tunnelState, locked) {
@@ -166,34 +196,46 @@ function tunnelCard(app, index, tunnelState, locked) {
 function renderNetwork() {
   const room = state.room || {};
   const joinActive = ['connecting', 'retrying', 'connected'].includes(state.joinState);
-  $('hostToggle').disabled = state.openP2PRunning || joinActive || !!roomBusy;
+  $('hostToggle').disabled = !coreReady || state.openP2PRunning || joinActive || !!roomBusy;
+  $('hostToggle').toggleAttribute('aria-busy', !!roomBusy);
   $('hostToggle').textContent = roomBusy === 'stopping' ? '关闭中…' : roomBusy === 'starting' ? '启动中…' : room.running ? '关闭网络' : '创建 / 启动网络';
-  $('joinPermission').disabled = !room.running;
+  $('joinPermission').disabled = !coreReady || !room.running;
   $('joinPermission').textContent = room.joinEnabled ? '暂停加入' : '恢复加入';
-  $('rotateInvite').disabled = !room.running;
-  $('joinInvite').disabled = room.running || joinActive;
-  $('deviceName').disabled = room.running || joinActive;
-  $('joinToggle').disabled = room.running || state.openP2PRunning || (joinBusy && !joinActive);
-  $('joinToggle').textContent = joinBusy ? '处理中…' : joinActive ? '离开网络' : '加入网络';
+  $('rotateInvite').disabled = !coreReady || !room.running;
+  $('joinInvite').disabled = !coreReady || room.running || joinActive || joinBusy === 'joining';
+  $('deviceName').disabled = !coreReady || room.running || joinActive || joinBusy === 'joining';
+  $('joinToggle').disabled = !coreReady || room.running || state.openP2PRunning || joinBusy === 'leaving';
+  $('joinToggle').toggleAttribute('aria-busy', joinBusy);
+  $('joinToggle').textContent = joinBusy === 'leaving' ? '离开中…' : joinBusy === 'joining' ? '取消连接' : joinActive ? '离开网络' : '加入网络';
   $('memberCount').textContent = (room.members || []).length;
   $('memberEmpty').hidden = (room.members || []).length !== 0;
   $('memberList').replaceChildren(...(room.members || []).map(memberRow));
+  $('blockedCount').textContent = (room.blockedUids || []).length;
+  $('blockedEmpty').hidden = (room.blockedUids || []).length !== 0;
+  $('blockedList').replaceChildren(...(room.blockedUids || []).map(blacklistRow));
 
   let label = '未连接', color = 'neutral', error = '';
-  if (room.running) { label = '房间运行中 · 局域网发现中继已启用'; color = 'success'; }
+  if (roomBusy === 'starting') { label = '正在启动网络'; color = 'warning'; }
+  else if (roomBusy === 'stopping') { label = '正在关闭网络'; color = 'warning'; }
+  else if (joinBusy === 'joining') { label = '正在连接房主'; color = 'warning'; }
+  else if (joinBusy === 'leaving') { label = '正在离开网络'; color = 'warning'; }
+  else if (room.running) { label = '房间运行中 · 局域网发现中继已启用'; color = 'success'; }
   else if (state.joinState === 'connected') { label = '已连接房主 · 局域网发现中继已启用'; color = 'success'; }
   else if (state.joinState === 'connecting') { label = '正在连接房主'; color = 'warning'; }
   else if (state.joinState === 'retrying') { label = '连接房主失败，Core 正在继续重试'; color = 'danger'; error = state.joinError || ''; }
   else if (state.joinState === 'failed') { label = '连接房主失败'; color = 'danger'; error = state.joinError || ''; }
   $('networkDot').className = `status-dot large ${color}`;
-  $('networkStatus').textContent = label;
+  if ($('networkStatus').textContent !== label) $('networkStatus').textContent = label;
   $('networkError').hidden = !error;
   $('networkError').textContent = error ? `失败原因：${error}` : '';
   $('virtualIp').value = room.running ? room.hostIP || '' : state.virtualIP || '';
+  $('copyInvite').disabled = !$('roomInvite').value;
+  $('copyVirtualIp').disabled = !$('virtualIp').value;
   $('relayAccepted').textContent = state.discovery?.accepted || 0;
   $('relayForwarded').textContent = state.discovery?.forwarded || 0;
   $('relayDropped').textContent = state.discovery?.dropped || 0;
-  const devices = room.running ? room.members || [] : state.devices || [];
+  const host = {name: '房主设备', uid: room.hostUid, virtualIP: room.hostIP, state: 'online', latencyMs: 0};
+  const devices = room.running ? [host, ...(room.members || [])] : state.devices || [];
   $('totalRx').textContent = bytes(devices.reduce((sum, item) => sum + (item.rxBytes || 0), 0));
   $('totalTx').textContent = bytes(devices.reduce((sum, item) => sum + (item.txBytes || 0), 0));
   $('deviceTable').replaceChildren(...devices.map(deviceRow));
@@ -202,30 +244,57 @@ function renderNetwork() {
 function memberRow(member) {
   const row = document.createElement('div');
   row.className = 'member-row';
-  row.innerHTML = `<span><strong>${escapeHTML(member.name || '未命名')}</strong><small>${escapeHTML(shortKey(member.publicKey))}</small></span><span>${escapeHTML(member.ip || '-')}</span><span>${escapeHTML(member.state || '-')}</span><button>移除</button>`;
-  row.querySelector('button').onclick = () => { if (confirm(`确定移除“${member.name || member.ip}”？该设备将不能继续使用当前成员密钥。`)) run(row.querySelector('button'), () => call('room.removeMember', {publicKey: member.publicKey})); };
+  row.innerHTML = `<span><strong>${escapeHTML(member.name || '未命名')}</strong><small>${escapeHTML(member.uid || shortKey(member.publicKey))}</small></span><span>${escapeHTML(member.ip || '-')}</span><span>${escapeHTML(member.state || '-')}</span><span class="button-row"><button class="remove">移除</button><button class="block danger" ${member.uid ? '' : 'disabled'}>拉黑</button></span>`;
+  row.querySelector('.remove').disabled = !coreReady;
+  row.querySelector('.block').disabled = !coreReady || !member.uid;
+  row.querySelector('.remove').onclick = () => { if (confirm(`确定移除“${member.name || member.ip}”？该设备之后仍可重新加入。`)) run(row.querySelector('.remove'), async () => { state.room = await call('room.removeMember', {publicKey: member.publicKey}); renderNetwork(); toast('成员已移除'); }); };
+  row.querySelector('.block').onclick = () => { if (confirm(`确定拉黑“${member.name || member.ip}”？UID ${member.uid} 在解除黑名单前无法加入。`)) run(row.querySelector('.block'), async () => { state.room = await call('room.blockMember', {publicKey: member.publicKey}); renderNetwork(); toast('成员已加入黑名单'); }); };
+  return row;
+}
+
+function blacklistRow(uid) {
+  const row = document.createElement('div');
+  row.className = 'member-row';
+  row.innerHTML = `<span><strong>已拉黑设备</strong><small>${escapeHTML(uid)}</small></span><span></span><span>禁止加入</span><button>解除</button>`;
+  row.querySelector('button').disabled = !coreReady;
+  row.querySelector('button').onclick = () => run(row.querySelector('button'), async () => { state.room = await call('room.unblockUID', {uid}); renderNetwork(); toast('已解除黑名单'); });
   return row;
 }
 
 function deviceRow(item) {
   const hostMember = Object.hasOwn(item, 'publicKey');
   const row = document.createElement('tr');
-  const values = [item.name || (hostMember ? '未命名' : '设备'), item.uid || shortKey(item.publicKey), item.ip || item.virtualIP || '-', item.state || (state.joinState === 'connected' ? 'online' : '-'), bytes(item.rxBytes), bytes(item.txBytes)];
+  const values = [item.name || (item.virtualIP === '10.0.23.1' ? '房主设备' : hostMember ? '未命名' : '设备'), item.uid || shortKey(item.publicKey), item.ip || item.virtualIP || '-', item.state || (state.joinState === 'connected' ? 'online' : '-'), `${Math.max(0, item.latencyMs || 0)} ms`, bytes(item.rxBytes), bytes(item.txBytes)];
   for (const value of values) { const cell = document.createElement('td'); cell.textContent = value || '-'; row.append(cell); }
   const action = document.createElement('td');
-  if (hostMember) { const button = document.createElement('button'); button.textContent = '移除'; button.onclick = () => { if (confirm('确定移除该成员？')) run(button, () => call('room.removeMember', {publicKey: item.publicKey})); }; action.append(button); }
+  if (hostMember) {
+    const remove = document.createElement('button'); remove.textContent = '移除'; remove.disabled = !coreReady; remove.onclick = () => { if (confirm('确定移除该成员？该设备之后仍可重新加入。')) run(remove, async () => { state.room = await call('room.removeMember', {publicKey: item.publicKey}); renderNetwork(); }); }; action.append(remove);
+    const block = document.createElement('button'); block.textContent = '拉黑'; block.disabled = !coreReady || !item.uid; block.onclick = () => { if (confirm(`确定拉黑 UID ${item.uid}？解除黑名单前该用户无法加入。`)) run(block, async () => { state.room = await call('room.blockMember', {publicKey: item.publicKey}); renderNetwork(); }); }; action.append(block);
+  }
   row.append(action);
   return row;
 }
 
 async function saveApps(nextApps) {
+  if (savingApps) return false;
+  savingApps = true;
+  const previous = apps;
+  apps = nextApps;
+  renderTunnels();
   try {
     apps = await call('tunnel.replace', {apps: nextApps});
     if (config) config.Apps = apps;
     toast('隧道配置已保存');
     log('隧道配置已保存');
+    return true;
+  } catch (error) {
+    apps = previous;
+    showError(error);
+    return false;
+  } finally {
+    savingApps = false;
     renderTunnels();
-  } catch (error) { showError(error); renderTunnels(); }
+  }
 }
 
 function updateTunnel(index, patch) {
@@ -238,10 +307,11 @@ function moveTunnel(from, to) {
   const next = [...apps];
   const [item] = next.splice(from, 1);
   next.splice(to, 0, item);
-  saveApps(next);
+  return saveApps(next);
 }
 
 function openTunnelDialog(index = -1) {
+  clearError();
   const app = index >= 0 ? apps[index] : null;
   $('tunnelDialogTitle').textContent = app ? '编辑隧道' : '添加隧道';
   $('saveTunnel').textContent = app ? '保存更改' : '添加隧道';
@@ -252,31 +322,41 @@ function openTunnelDialog(index = -1) {
   $('localPort').value = app?.SrcPort || '';
   $('tunnelProtocol').value = app?.Protocol || 'tcp';
   $('presetSelect').value = '';
+  $('presetSelect').disabled = !!app;
   $('presetNote').textContent = '';
+  for (const id of ['tunnelName', 'tunnelUid', 'remotePort', 'localPort']) clearFieldError(id);
+  updatePresetFields();
   if (app) $('localPort').dataset.edited = '1'; else delete $('localPort').dataset.edited;
   $('tunnelDialog').showModal();
   $('tunnelUid').focus();
 }
 
-$('tunnelForm').onsubmit = event => {
+const tunnelNameError = Object.assign(document.createElement('small'), {id: 'tunnelNameError', className: 'field-error', hidden: true});
+$('tunnelName').after(tunnelNameError);
+$('tunnelName').setAttribute('aria-describedby', tunnelNameError.id);
+$('tunnelForm').noValidate = true;
+$('tunnelForm').onsubmit = async event => {
   event.preventDefault();
+  if (savingApps) return;
   const index = Number($('tunnelIndex').value);
   const uid = $('tunnelUid').value.trim().replaceAll(' ', '');
-  const name = $('tunnelName').value.trim().replaceAll(' ', '') || '自定义';
-  if (!uid || uid === config?.Network?.Node) return showError(new Error(uid ? '不能创建连接到本机 UID 的隧道。' : '请输入房主 UID。'));
+  const name = $('tunnelName').value.trim().replaceAll(' ', '');
+  if (!name) return setFieldError('tunnelName', '请输入隧道名称后重试。');
+  if (!uid || uid === config?.Network?.Node) {
+    return setFieldError('tunnelUid', uid ? '不能连接本机 UID，请输入远端 UID。' : '请输入房主 UID 后重试。');
+  }
   const selectedPreset = $('presetSelect').value === '' ? null : presets[Number($('presetSelect').value)];
   let next = [...apps];
   if (selectedPreset && index < 0) {
     for (const item of selectedPreset.tunnel || []) next = addWithConflict(next, makeApp(selectedPreset.name, uid, item.type, item.Sport, item.Cport || item.CPort || item.Sport));
-    toast(selectedPreset.note || `已添加${selectedPreset.name}预设`);
   } else {
     const remote = Number($('remotePort').value), local = Number($('localPort').value), protocol = $('tunnelProtocol').value;
-    if (!validPort(remote) || !validPort(local)) return showError(new Error('端口必须在 1–65535 之间。'));
+    if (!validPort(remote)) return setFieldError('remotePort', '请输入 1–65535 之间的整数端口。');
+    if (!validPort(local)) return setFieldError('localPort', '请输入 1–65535 之间的整数端口。');
     const app = index >= 0 ? {...apps[index], AppName: name, PeerNode: uid, Protocol: protocol, DstPort: remote, SrcPort: local} : makeApp(name, uid, protocol, remote, local);
     if (index >= 0) next[index] = app; else next = addWithConflict(next, app);
   }
-  $('tunnelDialog').close();
-  saveApps(next);
+  if (await saveApps(next)) $('tunnelDialog').close();
 };
 
 function makeApp(name, uid, protocol, remote, local, enabled = 1) {
@@ -303,42 +383,79 @@ function validPort(value) { return Number.isInteger(value) && value >= 1 && valu
 
 async function loadInvite() {
   if (!state?.room?.hostUid) return;
-  try { $('roomInvite').value = (await call('room.getInvite')).invite || ''; } catch { /* no persisted room */ }
+  try {
+    $('roomInvite').value = (await call('room.getInvite')).invite || '';
+    $('copyInvite').disabled = !$('roomInvite').value;
+  } catch { /* no persisted room */ }
 }
 
-async function run(button, work, busyText = '处理中…') {
+async function run(button, work, busyText = '处理中…', requiresCore = true) {
   const old = button.textContent;
   button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
   button.textContent = busyText;
   clearError();
-  try { return await work(); } catch (error) { showError(error); } finally { button.disabled = false; button.textContent = old; }
+  try { return await work(); } catch (error) { showError(error); } finally { button.disabled = requiresCore && !coreReady; button.removeAttribute('aria-busy'); button.textContent = old; }
 }
 
 function showError(error) {
   const detail = error.detail && error.detail !== error.message ? `\n详细信息：${error.detail}` : '';
-  $('alert').textContent = `${error.message}${detail}`;
-  $('alert').hidden = false;
+  const dialog = document.querySelector('dialog[open]');
+  let target = dialog?.querySelector('.dialog-error') || $('alert');
+  if (dialog && target === $('alert')) {
+    target = Object.assign(document.createElement('div'), {className: 'inline-error dialog-error'});
+    dialog.querySelector('form').prepend(target);
+  }
+  target.setAttribute('role', 'alert');
+  target.tabIndex = -1;
+  target.textContent = `${error.message}${detail}`;
+  target.hidden = false;
+  target.focus();
   log(`错误：${error.message}${detail}`);
 }
-function clearError() { $('alert').hidden = true; $('alert').textContent = ''; }
-function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 2600); }
+function clearError() { document.querySelectorAll('#alert,.dialog-error').forEach(item => { item.hidden = true; item.textContent = ''; }); }
+function setFieldError(id, message) {
+  const input = $(id), error = $(`${id}Error`);
+  input.setCustomValidity(message);
+  input.toggleAttribute('aria-invalid', !!message);
+  if (error) { error.textContent = message; error.hidden = !message; }
+  if (message) { input.focus(); input.reportValidity(); }
+}
+function clearFieldError(id) { setFieldError(id, ''); }
+function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 3500); }
 function log(message) { uiLogs.unshift(`[${new Date().toLocaleString()}] ${message}`); uiLogs.length = Math.min(uiLogs.length, 500); renderLogs(); }
 async function refreshLogs() {
   try { coreLogText = (await call('log.read')).text || ''; renderLogs(); } catch (error) { showError(error); }
 }
-function renderLogs() { $('logOutput').textContent = `${coreLogText}${coreLogText ? '\n' : ''}===== Web 控制台 =====\n${uiLogs.join('\n')}`; }
+function renderLogs() {
+  $('logOutput').textContent = `${coreLogText}${coreLogText ? '\n' : ''}===== Web 控制台 =====\n${uiLogs.join('\n')}`;
+  $('copyLogs').disabled = !coreLogText && !uiLogs.length;
+}
 function bytes(value = 0) { const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; let i = 0; while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; } return `${value.toFixed(i ? 1 : 0)} ${units[i]}`; }
 function shortKey(value = '') { return value.slice(0, 10) + (value.length > 10 ? '…' : ''); }
 function escapeHTML(value = '') { return String(value).replace(/[&<>'"]/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[char])); }
 function tunnelError(value = '') { return /not found|offline|no route|no known endpoint/i.test(value) ? '对端不在线' : '连接异常'; }
 
 async function copyText(value, message = '已复制') {
-  if (!value) return;
-  try { await navigator.clipboard.writeText(value); toast(message); }
-  catch { const input = document.createElement('textarea'); input.value = value; document.body.append(input); input.select(); document.execCommand('copy'); input.remove(); toast(message); }
+  if (!value) { showError(new Error('没有可复制的内容。')); return false; }
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const input = document.createElement('textarea');
+    input.value = value;
+    document.body.append(input);
+    input.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch {}
+    finally { input.remove(); }
+    if (!copied) { showError(new Error('复制失败，请手动选择内容后复制。')); return false; }
+  }
+  toast(message);
+  return true;
 }
 
 function showTextDialog(title, help, value, confirm) {
+  clearError();
   $('textDialogTitle').textContent = title;
   $('textDialogHelp').textContent = help;
   $('textDialogInput').value = value;
@@ -347,24 +464,65 @@ function showTextDialog(title, help, value, confirm) {
   $('textDialogInput').focus();
 }
 
+const mobileNavigation = matchMedia('(max-width: 900px)');
+const sidebar = $('sidebar');
+const workspace = document.querySelector('.workspace');
+
+function closeNavigation(returnFocus = true) {
+  sidebar.classList.remove('open');
+  sidebar.inert = mobileNavigation.matches;
+  workspace.inert = false;
+  $('menuButton').setAttribute('aria-expanded', 'false');
+  $('menuButton').setAttribute('aria-label', '打开导航');
+  if (returnFocus && mobileNavigation.matches) $('menuButton').focus();
+}
+
+function openNavigation() {
+  sidebar.inert = false;
+  workspace.inert = true;
+  sidebar.classList.add('open');
+  $('menuButton').setAttribute('aria-expanded', 'true');
+  $('menuButton').setAttribute('aria-label', '关闭导航');
+  sidebar.querySelector('.nav-item.active').focus();
+}
+
+function showPage(name) {
+  const button = document.querySelector(`[data-page="${CSS.escape(name)}"]`) || document.querySelector('[data-page="tunnels"]');
+  const page = $(`page-${button.dataset.page}`);
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.classList.toggle('active', item === button);
+    if (item === button) item.setAttribute('aria-current', 'page'); else item.removeAttribute('aria-current');
+  });
+  document.querySelectorAll('.page').forEach(item => item.classList.toggle('active', item === page));
+  closeNavigation(false);
+  clearError();
+  const heading = page.querySelector('h1');
+  heading.tabIndex = -1;
+  heading.focus();
+  if (button.dataset.page === 'logs' && socket?.readyState === WebSocket.OPEN) refreshLogs();
+}
+
 document.querySelectorAll('.nav-item').forEach(button => button.onclick = () => {
-  document.querySelectorAll('.nav-item').forEach(item => item.classList.toggle('active', item === button));
-  document.querySelectorAll('.page').forEach(page => page.classList.toggle('active', page.id === `page-${button.dataset.page}`));
-  location.hash = button.dataset.page;
-  document.querySelector('.sidebar').classList.remove('open');
-  if (button.dataset.page === 'logs') refreshLogs();
+  const hash = `#${button.dataset.page}`;
+  if (location.hash === hash) showPage(button.dataset.page); else location.hash = hash;
 });
-$('menuButton').onclick = () => document.querySelector('.sidebar').classList.toggle('open');
+window.onhashchange = () => showPage(location.hash.slice(1));
+$('menuButton').onclick = () => sidebar.classList.contains('open') ? closeNavigation() : openNavigation();
+$('sidebarBackdrop').onclick = () => closeNavigation();
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && sidebar.classList.contains('open')) closeNavigation(); });
+mobileNavigation.addEventListener('change', () => closeNavigation(false));
+closeNavigation(false);
 $('newTunnel').onclick = () => openTunnelDialog();
 $('remotePort').oninput = () => { if (!$('localPort').dataset.edited) $('localPort').value = $('remotePort').value; };
 $('localPort').oninput = () => $('localPort').dataset.edited = '1';
+for (const id of ['tunnelName', 'tunnelUid', 'remotePort', 'localPort', 'shareBandwidth', 'joinInvite', 'allowedClientIps']) $(id).addEventListener('input', () => clearFieldError(id));
 document.querySelectorAll('.close-dialog').forEach(button => button.onclick = () => button.closest('dialog').close());
 $('copyUid').onclick = () => copyText($('localUid').value, 'UID 已复制');
 $('shareBandwidth').onchange = async () => {
   const value = Number($('shareBandwidth').value);
-  if (!Number.isInteger(value) || value < 0) return showError(new Error('共享带宽必须是非负整数。'));
-  config.Network.ShareBandwidth = value;
-  try { config = await call('config.replace', {config}); toast('共享带宽已保存'); } catch (error) { showError(error); }
+  if (!$('shareBandwidth').checkValidity() || !Number.isInteger(value)) return setFieldError('shareBandwidth', '请输入 0–100000 之间的整数带宽。');
+  const nextConfig = {...config, Network: {...config.Network, ShareBandwidth: value}};
+  try { config = await call('config.replace', {config: nextConfig}); toast('共享带宽已保存'); } catch (error) { showError(error); }
 };
 $('toggleP2P').onclick = async () => {
   if (p2pBusy) return;
@@ -380,11 +538,11 @@ $('exportCode').onclick = () => {
   if (!code) return showError(new Error('没有启用的隧道，无法导出连接码。'));
   copyText(code, '启用隧道的连接码已复制');
 };
-$('hostCode').onclick = () => showTextDialog('生成联机码', '输入本机游戏或服务端口，生成 UID:端口 的 TCP 快捷联机码。', '', value => { try { copyText(`${config.Network.Node}:${port(value.trim())}`, '快捷联机码已复制'); $('textDialog').close(); } catch (error) { showError(error); } });
-$('quickAdd').onclick = async () => {
+$('hostCode').onclick = () => showTextDialog('生成联机码', '输入本机游戏或服务端口，生成 UID:端口 的 TCP 快捷联机码。', '', async value => { try { if (await copyText(`${config.Network.Node}:${port(value.trim())}`, '快捷联机码已复制')) $('textDialog').close(); } catch (error) { showError(error); } });
+$('quickAdd').onclick = () => run($('quickAdd'), async () => {
   let clipboard = '';
   try { clipboard = await navigator.clipboard.readText(); } catch {}
-  showTextDialog('快速添加', '支持 UID:端口，或 1/2:UID:远程端口[:本地端口]；多个使用分号分隔。', clipboard, value => {
+  showTextDialog('快速添加', '支持 UID:端口，或 1/2:UID:远程端口[:本地端口]；多个使用分号分隔。', clipboard, async value => {
   try {
     const connections = parseCodes(value);
     let next = apps.map(app => ({...app, Enabled: 0}));
@@ -394,17 +552,17 @@ $('quickAdd').onclick = async () => {
       if (match >= 0) { next[match] = {...next[match], DstPort: item.remote, SrcPort: item.local, Enabled: 1}; used.add(match); }
       else next = addWithConflict(next, makeApp('自定义', item.uid, item.protocol, item.remote, item.local));
     }
-    $('textDialog').close(); saveApps(next);
+    if (await saveApps(next)) $('textDialog').close();
   } catch (error) { showError(error); }
   });
-};
+}, '读取中…');
 
 $('hostToggle').onclick = async () => {
   if (roomBusy) return;
   roomBusy = state.room.running ? 'stopping' : 'starting'; renderNetwork();
   try {
     if (state.room.running) await call('room.stop');
-    else { const result = await call('room.create', undefined, 30000); $('roomInvite').value = result.invite; await copyText(result.invite, '网络已创建，邀请码已复制'); }
+    else { const result = await call('room.create', undefined, 30000); $('roomInvite').value = result.invite; $('copyInvite').disabled = !result.invite; await copyText(result.invite, '网络已创建，邀请码已复制'); }
   } catch (error) { showError(error); }
   finally { roomBusy = ''; renderNetwork(); }
 };
@@ -413,17 +571,30 @@ $('joinPermission').onclick = () => run($('joinPermission'), () => call('room.se
 $('rotateInvite').onclick = async () => { if (!confirm('废除后，当前邀请码不能添加新成员，现有成员不受影响。继续吗？')) return; await run($('rotateInvite'), async () => { const result = await call('room.rotateKey'); $('roomInvite').value = result.invite; await copyText(result.invite, '新邀请码已复制'); }); };
 $('joinToggle').onclick = () => {
   const active = ['connecting', 'retrying', 'connected'].includes(state.joinState);
-  if (active) { joinBusy = true; renderNetwork(); call('room.leave').catch(showError).finally(() => { joinBusy = false; renderNetwork(); }); return; }
+  if (active || joinBusy === 'joining') {
+    const operation = ++joinOperation;
+    joinBusy = 'leaving';
+    renderNetwork();
+    call('room.leave').catch(showError).finally(() => { if (operation === joinOperation) { joinBusy = ''; renderNetwork(); } });
+    return;
+  }
   const invite = $('joinInvite').value.trim();
-  if (!invite) return showError(new Error('请输入 OPL2 邀请码。'));
-  joinBusy = true; renderNetwork();
-  call('room.join', {invite, name: $('deviceName').value.trim()}, 0).catch(error => { if (!['INVALID_STATE'].includes(error.code)) showError(error); }).finally(() => { joinBusy = false; renderNetwork(); });
+  if (!invite) return setFieldError('joinInvite', '请输入 OPL2 邀请码后重试。');
+  const operation = ++joinOperation;
+  joinBusy = 'joining';
+  renderNetwork();
+  call('room.join', {invite, name: $('deviceName').value.trim()}, 30000).catch(async error => {
+    if (operation !== joinOperation || error.code === 'INVALID_STATE') return;
+    await call('room.leave').catch(() => {});
+    if (operation !== joinOperation) return;
+    setFieldError('joinInvite', `${error.message} 请检查联机码或网络后重试。`);
+  }).finally(() => { if (operation === joinOperation) { joinBusy = ''; renderNetwork(); } });
 };
 $('copyVirtualIp').onclick = () => copyText($('virtualIp').value, '虚拟 IP 已复制');
 $('copyLogs').onclick = () => copyText($('logOutput').textContent, '日志已复制');
-$('refreshLogs').onclick = refreshLogs;
+$('refreshLogs').onclick = () => run($('refreshLogs'), refreshLogs, '刷新中…');
 $('clearLogs').onclick = () => { uiLogs.length = 0; coreLogText = ''; renderLogs(); };
-$('refreshNotices').onclick = loadContent;
+$('refreshNotices').onclick = () => run($('refreshNotices'), loadNotices, '刷新中…', false);
 $('shutdown').onclick = () => { if (confirm('确定关闭后台 Core 和当前全部网络？')) run($('shutdown'), () => call('core.shutdown'), '关闭中…'); };
 $('copyManagementUrl').onclick = () => copyText($('managementUrl').value, '管理地址已复制');
 $('saveManagementInterface').onclick = async () => {
@@ -431,6 +602,7 @@ $('saveManagementInterface').onclick = async () => {
   const address = $('managementInterface').value;
   if (!address || address === management?.address) return toast('当前已经使用该网卡');
   button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
   button.textContent = '切换中…';
   try {
     management = await call('management.setAddress', {address});
@@ -439,54 +611,104 @@ $('saveManagementInterface').onclick = async () => {
   } catch (error) {
     showError(error);
     button.disabled = false;
+    button.removeAttribute('aria-busy');
     button.textContent = '应用网卡';
   }
 };
 $('saveAllowedClientIps').onclick = async () => {
   const values = $('allowedClientIps').value.split(/[\s,;，；]+/).map(value => value.trim()).filter(Boolean);
   await run($('saveAllowedClientIps'), async () => {
-    management = await call('management.setAllowedIPs', {allowedIPs: values});
-    renderManagement();
-    toast('访问限制已保存');
+    try {
+      management = await call('management.setAllowedIPs', {allowedIPs: values});
+      renderManagement();
+      toast('访问限制已保存');
+    } catch (error) {
+      setFieldError('allowedClientIps', `${error.message} 请修正 IPv4 地址后重试。`);
+    }
   }, '保存中…');
 };
 
+const accentColors = {'#2563eb': '#1d4ed8', '#047857': '#065f46', '#7c3aed': '#6d28d9', '#b42318': '#912018'};
 $('themeSelect').value = localStorage.getItem('opl-theme') || 'system';
-$('accentColor').value = localStorage.getItem('opl-accent') || '#2563eb';
+$('accentColor').value = Object.hasOwn(accentColors, localStorage.getItem('opl-accent')) ? localStorage.getItem('opl-accent') : '#2563eb';
 applyAppearance();
 $('themeSelect').onchange = () => { localStorage.setItem('opl-theme', $('themeSelect').value); applyAppearance(); };
 $('accentColor').oninput = () => { localStorage.setItem('opl-accent', $('accentColor').value); applyAppearance(); };
-function applyAppearance() { const theme = $('themeSelect').value; document.documentElement.dataset.theme = theme === 'system' ? '' : theme; document.documentElement.style.setProperty('--accent', $('accentColor').value); }
+function applyAppearance() { const theme = $('themeSelect').value, accent = $('accentColor').value; document.documentElement.dataset.theme = theme === 'system' ? '' : theme; document.documentElement.style.setProperty('--accent', accent); document.documentElement.style.setProperty('--accent-hover', accentColors[accent]); }
 
-$('presetSelect').onchange = () => { const preset = $('presetSelect').value === '' ? null : presets[Number($('presetSelect').value)]; $('presetNote').textContent = preset?.note || ''; };
+function updatePresetFields() {
+  const preset = $('presetSelect').value === '' ? null : presets[Number($('presetSelect').value)];
+  const usingPreset = !!preset && Number($('tunnelIndex').value) < 0;
+  $('presetNote').textContent = preset?.note || '';
+  $('manualPorts').hidden = usingPreset;
+  $('manualProtocol').hidden = usingPreset;
+  for (const id of ['remotePort', 'localPort', 'tunnelProtocol']) $(id).disabled = usingPreset;
+}
+$('presetSelect').onchange = updatePresetFields;
 $('serverSelect').onchange = async () => {
   const selected = servers[Number($('serverSelect').value)];
   if (!selected || !config) return;
-  config.Network.ServerHost = selected.ServerHost;
-  config.Network.Token = String(selected.Token);
-  config.Network.User = 'gldoffice';
-  try { config = await call('config.replace', {config}); toast('连接节点已保存'); } catch (error) { showError(error); }
+  const nextConfig = {...config, Network: {...config.Network, ServerHost: selected.ServerHost, Token: String(selected.Token), User: 'gldoffice'}};
+  try { config = await call('config.replace', {config: nextConfig}); toast('连接节点已保存'); } catch (error) { showError(error); }
 };
 
-async function loadContent() {
-  const local = location.protocol !== 'file:' && location.port === '26780';
-  const source = name => local ? `/content/${name}` : `https://file.gldhn.top/file/json/${name}.json`;
+function contentSource(name) {
+  return location.protocol !== 'file:' && location.port === '26780' ? `/content/${name}` : `https://file.gldhn.top/file/json/${name}.json`;
+}
+
+async function contentJSON(name) {
+  const response = await fetch(contentSource(name));
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+function noticeMessage(message, retry = false) {
+  const card = document.createElement('div');
+  card.className = 'card notice';
+  card.textContent = message;
+  if (retry) {
+    const button = document.createElement('button');
+    button.textContent = '重试';
+    button.onclick = () => run(button, loadNotices, '重试中…', false);
+    card.append(document.createElement('br'), button);
+  }
+  $('notices').replaceChildren(card);
+}
+
+async function loadNotices() {
   try {
-    const data = await (await fetch(source('notice'))).json();
-    $('notices').replaceChildren(...(data.notices || []).reverse().map(item => { const card = document.createElement('article'); card.className = 'notice card'; const header = document.createElement('header'), title = document.createElement('h2'), time = document.createElement('time'), body = document.createElement('p'); title.textContent = item.title || ''; time.textContent = item.time || ''; body.textContent = item.content || ''; header.append(title, time); card.append(header, body); return card; }));
-  } catch { $('notices').innerHTML = '<div class="card notice">公告获取失败，请检查网络连接。</div>'; }
-  try { const data = await (await fetch(source('update'))).json(); $('updateLog').textContent = data.uplog || '暂无更新日志'; } catch { $('updateLog').textContent = '更新日志获取失败'; }
-  try { const data = await (await fetch(source('thank'))).json(); $('thanks').textContent = `afdian.com/@guailoudou\n${(data.list || []).map(item => `${item.name}：${item.num}`).join('\n')}`; } catch { $('thanks').textContent = '鸣谢信息获取失败'; }
+    const notices = (await contentJSON('notice')).notices || [];
+    if (!notices.length) return noticeMessage('暂无公告。');
+    $('notices').replaceChildren(...notices.reverse().map(item => { const card = document.createElement('article'); card.className = 'notice card'; const header = document.createElement('header'), title = document.createElement('h2'), time = document.createElement('time'), body = document.createElement('p'); title.textContent = item.title || ''; time.textContent = item.time || ''; body.textContent = item.content || ''; header.append(title, time); card.append(header, body); return card; }));
+  } catch { noticeMessage('公告获取失败，请检查网络连接后重试。', true); }
+}
+
+async function loadAboutContent() {
+  try { const data = await contentJSON('update'); $('updateLog').textContent = data.uplog || '暂无更新日志'; } catch { $('updateLog').textContent = '更新日志获取失败，请稍后刷新页面重试。'; }
+  try { const data = await contentJSON('thank'); $('thanks').textContent = `afdian.com/@guailoudou\n${(data.list || []).map(item => `${item.name}：${item.num}`).join('\n')}`; } catch { $('thanks').textContent = '鸣谢信息获取失败，请稍后刷新页面重试。'; }
+}
+
+async function loadPresets() {
   try {
-    const data = await (await fetch(source('preset'))).json();
+    const data = await contentJSON('preset');
     presets = data.presets || []; servers = data.servers || [];
+    if (!servers.length) throw new Error('节点列表为空');
     $('presetSelect').replaceChildren(new Option('不使用预设', ''), ...presets.map((item, index) => new Option(item.name, index)));
     $('serverSelect').replaceChildren(...servers.map((item, index) => new Option(item.ServerName, index)));
     if (config) $('serverSelect').value = String(Math.max(0, servers.findIndex(item => item.ServerHost === config.Network.ServerHost)));
-  } catch { $('serverSelect').replaceChildren(new Option('节点列表获取失败', '')); }
+    $('serverSelect').disabled = !coreReady;
+    $('retryServers').hidden = true;
+  } catch {
+    $('serverSelect').replaceChildren(new Option('节点列表获取失败', ''));
+    $('serverSelect').disabled = true;
+    $('retryServers').hidden = false;
+  }
 }
+$('retryServers').onclick = () => run($('retryServers'), loadPresets, '重试中…', false);
 
-const initialPage = location.hash.slice(1);
-if (initialPage && document.querySelector(`[data-page="${CSS.escape(initialPage)}"]`)) document.querySelector(`[data-page="${CSS.escape(initialPage)}"]`).click();
+function loadContent() { return Promise.all([loadNotices(), loadAboutContent(), loadPresets()]); }
+
+renderLogs();
+showPage(location.hash.slice(1));
 connect();
 loadContent();
