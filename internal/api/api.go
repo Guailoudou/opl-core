@@ -183,7 +183,7 @@ func RunWithServices(input io.Reader, output io.Writer, platform string, service
 func Hello(platform string) map[string]any {
 	return map[string]any{
 		"event": "hello", "apiVersion": APIVersion, "coreVersion": CoreVersion, "platform": platform,
-		"capabilities": []string{"openp2p", "wireguard-hot-update", "invite-v2", "pairing-v2", "pairing-tcp-sync-v1", "room-v1", "fixed-secret", "lease-v1", "discovery-relay-v1", "websocket-v1", "logs-v1", "management-interface-v1", "management-access-list-v1", "windows-tray-v1"},
+		"capabilities": []string{"openp2p", "wireguard-hot-update", "invite-v2", "pairing-v2", "pairing-tcp-sync-v2", "room-v1", "fixed-secret", "lease-v1", "discovery-relay-v1", "websocket-v1", "logs-v1", "management-interface-v1", "management-access-list-v1", "windows-tray-v1"},
 	}
 }
 
@@ -269,6 +269,24 @@ func dispatch(ctx context.Context, services Services, req request) (any, *protoc
 			return nil, invalidRequest(), false
 		}
 		value, err := rooms.RemoveMember(params.PublicKey)
+		return value, commandError(err), false
+	case "room.blockMember":
+		var params struct {
+			PublicKey string `json:"publicKey"`
+		}
+		if !decodeParams(req.Params, &params) || params.PublicKey == "" {
+			return nil, invalidRequest(), false
+		}
+		value, err := rooms.BlockMember(params.PublicKey)
+		return value, commandError(err), false
+	case "room.unblockUID":
+		var params struct {
+			UID string `json:"uid"`
+		}
+		if !decodeParams(req.Params, &params) || params.UID == "" {
+			return nil, invalidRequest(), false
+		}
+		value, err := rooms.UnblockUID(params.UID)
 		return value, commandError(err), false
 	case "room.renameMember":
 		var params struct {

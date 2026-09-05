@@ -76,12 +76,14 @@ type Member struct {
 	LastHandshake int64  `json:"lastHandshake,omitempty"`
 	RxBytes       uint64 `json:"rxBytes,omitempty"`
 	TxBytes       uint64 `json:"txBytes,omitempty"`
+	LatencyMS     int64  `json:"latencyMs"`
 }
 
 type MemberStats struct {
 	LastHandshake time.Time
 	RxBytes       uint64
 	TxBytes       uint64
+	LatencyMS     int64
 }
 
 type Snapshot struct {
@@ -95,6 +97,7 @@ type Snapshot struct {
 	RelayPort     uint16   `json:"discoveryRelayPort,omitempty"`
 	HostIP        string   `json:"hostIP,omitempty"`
 	Members       []Member `json:"members"`
+	BlockedUIDs   []string `json:"blockedUids"`
 }
 
 type Service struct {
@@ -120,7 +123,7 @@ type Service struct {
 	allocator      *lease.Allocator
 	memberStates   map[[32]byte]string
 	memberPSKs     map[[32]byte][32]byte
-	blocked        map[[32]byte]bool
+	blockedUIDs    map[string]bool
 	runtimeStats   map[[32]byte]MemberStats
 	reportedStats  map[[32]byte]MemberStats
 	memberUIDs     map[[32]byte]string
@@ -170,7 +173,7 @@ func New(options Options) (*Service, error) {
 		relayPort:      options.DiscoveryRelayPort,
 		memberStates:   make(map[[32]byte]string),
 		memberPSKs:     make(map[[32]byte][32]byte),
-		blocked:        make(map[[32]byte]bool),
+		blockedUIDs:    make(map[string]bool),
 		runtimeStats:   make(map[[32]byte]MemberStats),
 		reportedStats:  make(map[[32]byte]MemberStats),
 		memberUIDs:     make(map[[32]byte]string),
@@ -236,7 +239,7 @@ func (s *Service) Create(options CreateOptions) (Snapshot, error) {
 	s.allocator = allocator
 	s.memberStates = make(map[[32]byte]string)
 	s.memberPSKs = make(map[[32]byte][32]byte)
-	s.blocked = make(map[[32]byte]bool)
+	s.blockedUIDs = make(map[string]bool)
 	s.runtimeStats = make(map[[32]byte]MemberStats)
 	s.reportedStats = make(map[[32]byte]MemberStats)
 	s.memberUIDs = make(map[[32]byte]string)
@@ -343,7 +346,7 @@ func (s *Service) Start() (Snapshot, error) {
 	s.hostPrivate, s.hostPublic, s.allocator = privateKey, publicKey, allocator
 	s.memberStates = make(map[[32]byte]string, len(leasing))
 	s.memberPSKs = memberPSKs
-	s.blocked = blockedFromState(persisted.BlockedMembers)
+	s.blockedUIDs = stringSet(persisted.BlockedUIDs)
 	s.runtimeStats = make(map[[32]byte]MemberStats)
 	s.reportedStats = make(map[[32]byte]MemberStats)
 	s.memberUIDs = make(map[[32]byte]string)
@@ -474,6 +477,14 @@ func (s *Service) UpdateMemberStats(stats map[[32]byte]MemberStats) {
 }
 
 func (s *Service) RemoveMember(encodedKey string) (Snapshot, error) {
+	return s.removeMember(encodedKey, false)
+}
+
+func (s *Service) BlockMember(encodedKey string) (Snapshot, error) {
+	return s.removeMember(encodedKey, true)
+}
+
+func (s *Service) removeMember(encodedKey string, block bool) (Snapshot, error) {
 	key, err := decodePublicKey(encodedKey)
 	if err != nil {
 		return Snapshot{}, ErrInput
@@ -489,8 +500,14 @@ func (s *Service) RemoveMember(encodedKey string) (Snapshot, error) {
 	}
 	previousPSK, hadPSK := s.memberPSKs[key]
 	previousState := s.memberStates[key]
-	previousBlocked := s.blocked[key]
-	s.blocked[key] = true
+	uid := s.memberUIDs[key]
+	if block && !validUID(uid) {
+		return Snapshot{}, ErrInput
+	}
+	previousBlocked := s.blockedUIDs[uid]
+	if block {
+		s.blockedUIDs[uid] = true
+	}
 	s.allocator.Remove(key)
 	if timer := s.timers[key]; timer != nil {
 		timer.Stop()
@@ -504,11 +521,12 @@ func (s *Service) RemoveMember(encodedKey string) (Snapshot, error) {
 	delete(s.pending, key)
 	if s.removePeer != nil {
 		if err := s.removePeer(key); err != nil {
-			if !previousBlocked {
-				delete(s.blocked, key)
+			if block && !previousBlocked {
+				delete(s.blockedUIDs, uid)
 			}
 			_ = s.allocator.Restore(previous)
 			s.memberStates[key] = previousState
+			s.memberUIDs[key] = uid
 			if hadPSK {
 				s.memberPSKs[key] = previousPSK
 			}
@@ -517,17 +535,41 @@ func (s *Service) RemoveMember(encodedKey string) (Snapshot, error) {
 	}
 	if s.fixedRoom {
 		if err := s.persistLocked(); err != nil {
-			if !previousBlocked {
-				delete(s.blocked, key)
+			if block && !previousBlocked {
+				delete(s.blockedUIDs, uid)
 			}
 			_ = s.allocator.Restore(previous)
 			s.memberStates[key] = previousState
+			s.memberUIDs[key] = uid
 			if hadPSK {
 				s.memberPSKs[key] = previousPSK
 			}
 			if s.applyPeer != nil && hadPSK {
 				_ = s.applyPeer(previous, previousPSK)
 			}
+			return Snapshot{}, err
+		}
+	}
+	s.server.RemoveMember(key)
+	return s.snapshotLocked(), nil
+}
+
+func (s *Service) UnblockUID(uid string) (Snapshot, error) {
+	if !validUID(uid) {
+		return Snapshot{}, ErrInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return Snapshot{}, ErrStopped
+	}
+	if !s.blockedUIDs[uid] {
+		return Snapshot{}, ErrMember
+	}
+	delete(s.blockedUIDs, uid)
+	if s.fixedRoom {
+		if err := s.persistLocked(); err != nil {
+			s.blockedUIDs[uid] = true
 			return Snapshot{}, err
 		}
 	}
@@ -597,12 +639,14 @@ func (s *Service) listenLocked() error {
 			defer s.mu.Unlock()
 			return s.running && s.joinEnabled
 		},
+		BlockedUID:          s.blockedUID,
 		KnownMember:         s.knownMember,
 		MemberAuthKey:       s.memberAuthKey,
 		Assign:              s.assign,
 		PairingFailed:       s.pairingFailed,
 		PairingAcknowledged: s.pairingAcknowledged,
 		ReportStats:         s.reportStats,
+		HostDevice:          pairing.Device{UID: s.hostUID, VirtualIP: "10.0.23.1"},
 	})
 	if err != nil {
 		return err
@@ -616,9 +660,6 @@ func (s *Service) assign(key [32]byte, name string, roomKey pairing.RoomKey, exi
 	defer s.mu.Unlock()
 	if !s.running {
 		return pairing.Assignment{}, pairing.ErrJoinPaused
-	}
-	if s.blocked[key] {
-		return pairing.Assignment{}, pairing.ErrMemberDisabled
 	}
 	previous, existed := findLease(s.allocator.Snapshot(), key)
 	if !s.joinEnabled && !existed {
@@ -663,10 +704,16 @@ func (s *Service) assign(key [32]byte, name string, roomKey pairing.RoomKey, exi
 	return pairing.Assignment{IP: item.IP, Revision: item.Revision, Created: created, Token: pending.token}, nil
 }
 
+func (s *Service) blockedUID(uid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running && s.blockedUIDs[uid]
+}
+
 func (s *Service) knownMember(key [32]byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.running || s.allocator == nil || s.blocked[key] {
+	if !s.running || s.allocator == nil {
 		return false
 	}
 	item, ok := findLease(s.allocator.Snapshot(), key)
@@ -676,7 +723,7 @@ func (s *Service) knownMember(key [32]byte) bool {
 func (s *Service) memberAuthKey(key [32]byte) ([32]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.running || s.allocator == nil || s.blocked[key] {
+	if !s.running || s.allocator == nil {
 		return [32]byte{}, false
 	}
 	item, memberExists := findLease(s.allocator.Snapshot(), key)
@@ -754,7 +801,7 @@ func (s *Service) reportStats(key [32]byte, device pairing.Device) {
 		return
 	}
 	s.memberUIDs[key] = device.UID
-	s.reportedStats[key] = MemberStats{RxBytes: device.RxBytes, TxBytes: device.TxBytes}
+	s.reportedStats[key] = MemberStats{RxBytes: device.RxBytes, TxBytes: device.TxBytes, LatencyMS: device.LatencyMS}
 }
 
 func (s *Service) rollbackPairLocked(key [32]byte, pending pendingPair) {
@@ -787,15 +834,15 @@ func (s *Service) persistLocked() error {
 		return err
 	}
 	err := state.Save(s.statePath(), state.Room{
-		SchemaVersion:  state.SchemaVersion,
-		RoomID:         s.roomID,
-		HostUID:        s.hostUID,
-		PairPort:       s.pairPort,
-		WireGuardPort:  s.wgPort,
-		RelayPort:      s.relayPort,
-		JoinEnabled:    s.joinEnabled,
-		Members:        stateFromLeases(s.allocator.Snapshot()),
-		BlockedMembers: blockedForState(s.blocked),
+		SchemaVersion: state.SchemaVersion,
+		RoomID:        s.roomID,
+		HostUID:       s.hostUID,
+		PairPort:      s.pairPort,
+		WireGuardPort: s.wgPort,
+		RelayPort:     s.relayPort,
+		JoinEnabled:   s.joinEnabled,
+		Members:       stateFromLeases(s.allocator.Snapshot()),
+		BlockedUIDs:   sortedStrings(s.blockedUIDs),
 	})
 	if err == nil {
 		return nil
@@ -825,7 +872,7 @@ func (s *Service) persistRoomSecretLocked() error {
 }
 
 func (s *Service) snapshotLocked() Snapshot {
-	result := Snapshot{Running: s.running, FixedRoomKey: s.fixedRoom, FixedHostKey: s.fixedHost, JoinEnabled: s.joinEnabled, Members: []Member{}}
+	result := Snapshot{Running: s.running, FixedRoomKey: s.fixedRoom, FixedHostKey: s.fixedHost, JoinEnabled: s.joinEnabled, Members: []Member{}, BlockedUIDs: sortedStrings(s.blockedUIDs)}
 	if s.running || s.fixedRoom {
 		result.HostUID, result.PairPort = s.hostUID, s.pairPort
 		result.WireGuardPort, result.RelayPort, result.HostIP = s.wgPort, s.relayPort, "10.0.23.1"
@@ -848,7 +895,7 @@ func (s *Service) snapshotLocked() Snapshot {
 			PublicKey: base64.StdEncoding.EncodeToString(item.PublicKey[:]),
 			IP:        item.IP.String(), Name: item.Name, Enabled: item.Enabled,
 			State: s.memberStates[item.PublicKey], LeaseRevision: item.Revision,
-			LastHandshake: lastHandshake, RxBytes: traffic.RxBytes, TxBytes: traffic.TxBytes,
+			LastHandshake: lastHandshake, RxBytes: traffic.RxBytes, TxBytes: traffic.TxBytes, LatencyMS: traffic.LatencyMS,
 		})
 	}
 	return result
@@ -861,7 +908,7 @@ func (s *Service) clearLocked() {
 	s.allocator, s.server = nil, nil
 	s.memberStates = make(map[[32]byte]string)
 	s.memberPSKs = make(map[[32]byte][32]byte)
-	s.blocked = make(map[[32]byte]bool)
+	s.blockedUIDs = make(map[string]bool)
 	s.runtimeStats = make(map[[32]byte]MemberStats)
 	s.reportedStats = make(map[[32]byte]MemberStats)
 	s.memberUIDs = make(map[[32]byte]string)
@@ -930,24 +977,28 @@ func stateFromLeases(items []lease.Lease) []state.Member {
 	return result
 }
 
-func blockedForState(blocked map[[32]byte]bool) []string {
-	result := make([]string, 0, len(blocked))
-	for key, value := range blocked {
-		if value {
-			result = append(result, base64.StdEncoding.EncodeToString(key[:]))
+func sortedStrings(values map[string]bool) []string {
+	result := make([]string, 0, len(values))
+	for value, enabled := range values {
+		if enabled {
+			result = append(result, value)
 		}
 	}
 	sort.Strings(result)
 	return result
 }
 
-func blockedFromState(items []string) map[[32]byte]bool {
-	result := make(map[[32]byte]bool, len(items))
-	for _, encoded := range items {
-		key, _ := decodePublicKey(encoded)
-		result[key] = true
+func stringSet(items []string) map[string]bool {
+	result := make(map[string]bool, len(items))
+	for _, item := range items {
+		result[item] = true
 	}
 	return result
+}
+
+func validUID(uid string) bool {
+	decoded, err := hex.DecodeString(uid)
+	return err == nil && len(decoded) == 8 && hex.EncodeToString(decoded) == uid
 }
 
 func leasesFromState(items []state.Member) ([]lease.Lease, error) {

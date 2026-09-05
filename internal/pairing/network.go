@@ -36,6 +36,7 @@ type Assignment struct {
 }
 
 type Device struct {
+	LatencyMS int64  `json:"latencyMs"`
 	UID       string `json:"uid"`
 	VirtualIP string `json:"virtualIP"`
 	RxBytes   uint64 `json:"rxBytes"`
@@ -43,9 +44,10 @@ type Device struct {
 }
 
 type StatsReport struct {
-	UID     string
-	RxBytes uint64
-	TxBytes uint64
+	TimestampMS int64
+	UID         string
+	RxBytes     uint64
+	TxBytes     uint64
 }
 
 type ServerConfig struct {
@@ -54,12 +56,14 @@ type ServerConfig struct {
 	WireGuardPort       uint16
 	DiscoveryRelayPort  uint16
 	JoinEnabled         func() bool
+	BlockedUID          func(string) bool
 	KnownMember         func([32]byte) bool
 	MemberAuthKey       func([32]byte) ([32]byte, bool)
 	Assign              func([32]byte, string, RoomKey, bool) (Assignment, error)
 	PairingFailed       func([32]byte, Assignment)
 	PairingAcknowledged func([32]byte, Assignment)
 	ReportStats         func([32]byte, Device)
+	HostDevice          Device
 }
 
 type Server struct {
@@ -71,9 +75,11 @@ type Server struct {
 	rate         rateLimiter
 	connections  map[net.Conn]struct{}
 	devices      map[[32]byte]Device
+	memberUIDs   map[[32]byte]string
 	deviceOwners map[[32]byte]net.Conn
 	roomKey      RoomKey
 	keyMu        sync.RWMutex
+	writeMu      sync.Mutex
 	mu           sync.Mutex
 }
 
@@ -92,7 +98,7 @@ func Listen(address string, config ServerConfig) (*Server, error) {
 	}
 	s := &Server{
 		listener: listener, config: config, limit: make(chan struct{}, maxConcurrent),
-		rate: rateLimiter{tokens: 10, last: time.Now()}, connections: make(map[net.Conn]struct{}), devices: make(map[[32]byte]Device), deviceOwners: make(map[[32]byte]net.Conn), roomKey: config.RoomKey,
+		rate: rateLimiter{tokens: 10, last: time.Now()}, connections: make(map[net.Conn]struct{}), devices: make(map[[32]byte]Device), memberUIDs: make(map[[32]byte]string), deviceOwners: make(map[[32]byte]net.Conn), roomKey: config.RoomKey,
 	}
 	s.workers.Add(1)
 	go s.serve()
@@ -105,6 +111,22 @@ func (s *Server) SetRoomKey(roomKey RoomKey) {
 	s.keyMu.Lock()
 	s.roomKey = roomKey
 	s.keyMu.Unlock()
+}
+
+func (s *Server) RemoveMember(key [32]byte) {
+	s.mu.Lock()
+	connection := s.deviceOwners[key]
+	delete(s.devices, key)
+	delete(s.memberUIDs, key)
+	delete(s.deviceOwners, key)
+	s.mu.Unlock()
+	if connection == nil {
+		return
+	}
+	// ponytail: one global control-write lock; split per connection if status traffic becomes high.
+	s.writeMu.Lock()
+	_ = WriteFrame(connection, FramePairResult, []byte{StatusMemberDisabled})
+	s.writeMu.Unlock()
 }
 
 func (s *Server) Close() error {
@@ -194,6 +216,10 @@ func (s *Server) pair(connection net.Conn) ([32]byte, Assignment, bool) {
 		_ = WriteFrame(connection, FramePairResult, []byte{StatusAuthFailed})
 		return [32]byte{}, Assignment{}, false
 	}
+	if request.UID != "" && s.config.BlockedUID != nil && s.config.BlockedUID(request.UID) {
+		_ = WriteFrame(connection, FramePairResult, []byte{StatusMemberDisabled})
+		return [32]byte{}, Assignment{}, false
+	}
 	if !s.config.JoinEnabled() && (s.config.KnownMember == nil || !s.config.KnownMember(request.ClientPublicKey)) {
 		_ = WriteFrame(connection, FramePairResult, []byte{StatusJoinPaused})
 		return [32]byte{}, Assignment{}, false
@@ -233,6 +259,9 @@ func (s *Server) pair(connection net.Conn) ([32]byte, Assignment, bool) {
 	if s.config.PairingAcknowledged != nil {
 		s.config.PairingAcknowledged(request.ClientPublicKey, assignment)
 	}
+	s.mu.Lock()
+	s.memberUIDs[request.ClientPublicKey] = request.UID
+	s.mu.Unlock()
 	return request.ClientPublicKey, assignment, true
 }
 
@@ -255,11 +284,30 @@ func (s *Server) control(connection net.Conn, key [32]byte, ip netip.Addr) {
 		if err != nil {
 			return
 		}
-		device := Device{UID: report.UID, VirtualIP: ip.String(), RxBytes: report.RxBytes, TxBytes: report.TxBytes}
+		if s.config.KnownMember != nil && !s.config.KnownMember(key) {
+			s.writeMu.Lock()
+			_ = WriteFrame(connection, FramePairResult, []byte{StatusMemberDisabled})
+			s.writeMu.Unlock()
+			return
+		}
+		s.mu.Lock()
+		expectedUID := s.memberUIDs[key]
+		s.mu.Unlock()
+		if expectedUID != "" {
+			report.UID = expectedUID
+		}
+		latency := time.Now().UnixMilli() - report.TimestampMS
+		if report.TimestampMS <= 0 || latency < 0 {
+			latency = 0
+		}
+		device := Device{UID: report.UID, VirtualIP: ip.String(), RxBytes: report.RxBytes, TxBytes: report.TxBytes, LatencyMS: latency}
 		s.mu.Lock()
 		s.devices[key] = device
 		s.deviceOwners[key] = connection
-		devices := make([]Device, 0, len(s.devices))
+		devices := make([]Device, 0, len(s.devices)+1)
+		if s.config.HostDevice.VirtualIP != "" {
+			devices = append(devices, s.config.HostDevice)
+		}
 		for _, item := range s.devices {
 			devices = append(devices, item)
 		}
@@ -270,7 +318,10 @@ func (s *Server) control(connection net.Conn, key [32]byte, ip netip.Addr) {
 		if s.config.ReportStats != nil {
 			s.config.ReportStats(key, device)
 		}
-		if WriteFrame(connection, FrameDeviceSnapshot, marshalDevices(devices)) != nil {
+		s.writeMu.Lock()
+		err = WriteFrame(connection, FrameDeviceSnapshot, marshalDevices(devices))
+		s.writeMu.Unlock()
+		if err != nil {
 			return
 		}
 	}
@@ -298,6 +349,8 @@ func (s *Session) Sync(ctx context.Context, report StatsReport) ([]Device, error
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	started := time.Now()
+	report.TimestampMS = started.UnixMilli()
 	payload, err := marshalStatsReport(report)
 	if err != nil {
 		return nil, err
@@ -313,10 +366,22 @@ func (s *Session) Sync(ctx context.Context, report StatsReport) ([]Device, error
 		return nil, err
 	}
 	frameType, payload, err := ReadFrame(s.connection)
-	if err != nil || frameType != FrameDeviceSnapshot {
+	if err != nil {
 		return nil, protocolOrIO(err)
 	}
-	return parseDevices(payload)
+	if frameType == FramePairResult && len(payload) == 1 {
+		return nil, statusError(payload[0])
+	}
+	if frameType != FrameDeviceSnapshot {
+		return nil, ErrProtocol
+	}
+	devices, err := parseDevices(payload)
+	for index := range devices {
+		if devices[index].VirtualIP == "10.0.23.1" {
+			devices[index].LatencyMS = time.Since(started).Milliseconds()
+		}
+	}
+	return devices, err
 }
 
 func Pair(ctx context.Context, address string, roomKey RoomKey, clientPublicKey [32]byte, name string) (PairResult, error) {
@@ -332,7 +397,7 @@ func ReconnectWithConfigure(ctx context.Context, address string, memberPSK [32]b
 }
 
 func pairWithConfigure(ctx context.Context, address string, authKey []byte, clientPublicKey [32]byte, name string, configure func(PairResult) error) (PairResult, error) {
-	result, session, err := pairWithSession(ctx, address, authKey, clientPublicKey, name, configure)
+	result, session, err := pairWithSession(ctx, address, authKey, clientPublicKey, "", name, configure)
 	if session != nil {
 		_ = session.Close()
 	}
@@ -340,18 +405,26 @@ func pairWithConfigure(ctx context.Context, address string, authKey []byte, clie
 }
 
 func PairWithSession(ctx context.Context, address string, roomKey RoomKey, clientPublicKey [32]byte, name string, configure func(PairResult) error) (PairResult, *Session, error) {
-	return pairWithSession(ctx, address, roomKey[:], clientPublicKey, name, configure)
+	return pairWithSession(ctx, address, roomKey[:], clientPublicKey, "", name, configure)
 }
 
 func ReconnectWithSession(ctx context.Context, address string, memberPSK [32]byte, clientPublicKey [32]byte, name string) (PairResult, *Session, error) {
-	return pairWithSession(ctx, address, memberPSK[:], clientPublicKey, name, nil)
+	return pairWithSession(ctx, address, memberPSK[:], clientPublicKey, "", name, nil)
 }
 
 func ReconnectWithConfiguredSession(ctx context.Context, address string, memberPSK [32]byte, clientPublicKey [32]byte, name string, configure func(PairResult) error) (PairResult, *Session, error) {
-	return pairWithSession(ctx, address, memberPSK[:], clientPublicKey, name, configure)
+	return pairWithSession(ctx, address, memberPSK[:], clientPublicKey, "", name, configure)
 }
 
-func pairWithSession(ctx context.Context, address string, authKey []byte, clientPublicKey [32]byte, name string, configure func(PairResult) error) (PairResult, *Session, error) {
+func PairWithUIDSession(ctx context.Context, address string, roomKey RoomKey, clientPublicKey [32]byte, uid, name string, configure func(PairResult) error) (PairResult, *Session, error) {
+	return pairWithSession(ctx, address, roomKey[:], clientPublicKey, uid, name, configure)
+}
+
+func ReconnectWithUIDSession(ctx context.Context, address string, memberPSK [32]byte, clientPublicKey [32]byte, uid, name string, configure func(PairResult) error) (PairResult, *Session, error) {
+	return pairWithSession(ctx, address, memberPSK[:], clientPublicKey, uid, name, configure)
+}
+
+func pairWithSession(ctx context.Context, address string, authKey []byte, clientPublicKey [32]byte, uid, name string, configure func(PairResult) error) (PairResult, *Session, error) {
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp4", address)
 	if err != nil {
 		return PairResult{}, nil, err
@@ -373,7 +446,7 @@ func pairWithSession(ctx context.Context, address string, authKey []byte, client
 	if err != nil {
 		return fail(err)
 	}
-	request, err := newClientRequest(challenge, clientPublicKey, name, authKey, nil)
+	request, err := newClientRequest(challenge, clientPublicKey, uid, name, authKey, nil)
 	if err != nil {
 		return fail(err)
 	}
@@ -413,23 +486,24 @@ func marshalStatsReport(report StatsReport) ([]byte, error) {
 		return nil, ErrProtocol
 	}
 	uid := []byte(report.UID)
-	payload := make([]byte, 17+len(uid))
+	payload := make([]byte, 25+len(uid))
 	payload[0] = byte(len(uid))
 	copy(payload[1:], uid)
 	binary.BigEndian.PutUint64(payload[1+len(uid):], report.RxBytes)
 	binary.BigEndian.PutUint64(payload[9+len(uid):], report.TxBytes)
+	binary.BigEndian.PutUint64(payload[17+len(uid):], uint64(report.TimestampMS))
 	return payload, nil
 }
 
 func parseStatsReport(payload []byte) (StatsReport, error) {
-	if len(payload) < 18 {
+	if len(payload) < 26 {
 		return StatsReport{}, ErrProtocol
 	}
 	uidLength := int(payload[0])
-	if len(payload) != 17+uidLength {
+	if len(payload) != 25+uidLength {
 		return StatsReport{}, ErrProtocol
 	}
-	report := StatsReport{UID: string(payload[1 : 1+uidLength]), RxBytes: binary.BigEndian.Uint64(payload[1+uidLength:]), TxBytes: binary.BigEndian.Uint64(payload[9+uidLength:])}
+	report := StatsReport{UID: string(payload[1 : 1+uidLength]), RxBytes: binary.BigEndian.Uint64(payload[1+uidLength:]), TxBytes: binary.BigEndian.Uint64(payload[9+uidLength:]), TimestampMS: int64(binary.BigEndian.Uint64(payload[17+uidLength:]))}
 	if !validUID(report.UID) {
 		return StatsReport{}, ErrProtocol
 	}
@@ -441,12 +515,13 @@ func marshalDevices(devices []Device) []byte {
 	binary.BigEndian.PutUint16(payload, uint16(len(devices)))
 	for _, device := range devices {
 		uid, ip := []byte(device.UID), netip.MustParseAddr(device.VirtualIP).As4()
-		entry := make([]byte, 21+len(uid))
+		entry := make([]byte, 29+len(uid))
 		entry[0] = byte(len(uid))
 		copy(entry[1:], uid)
 		copy(entry[1+len(uid):], ip[:])
 		binary.BigEndian.PutUint64(entry[5+len(uid):], device.RxBytes)
 		binary.BigEndian.PutUint64(entry[13+len(uid):], device.TxBytes)
+		binary.BigEndian.PutUint64(entry[21+len(uid):], uint64(device.LatencyMS))
 		payload = append(payload, entry...)
 	}
 	return payload
@@ -466,7 +541,7 @@ func parseDevices(payload []byte) ([]Device, error) {
 			return nil, ErrProtocol
 		}
 		uidLength := int(payload[offset])
-		if offset+21+uidLength > len(payload) {
+		if offset+29+uidLength > len(payload) {
 			return nil, ErrProtocol
 		}
 		uid := string(payload[offset+1 : offset+1+uidLength])
@@ -474,8 +549,8 @@ func parseDevices(payload []byte) ([]Device, error) {
 			return nil, ErrProtocol
 		}
 		ip := netip.AddrFrom4([4]byte(payload[offset+1+uidLength : offset+5+uidLength]))
-		devices = append(devices, Device{UID: uid, VirtualIP: ip.String(), RxBytes: binary.BigEndian.Uint64(payload[offset+5+uidLength:]), TxBytes: binary.BigEndian.Uint64(payload[offset+13+uidLength:])})
-		offset += 21 + uidLength
+		devices = append(devices, Device{UID: uid, VirtualIP: ip.String(), RxBytes: binary.BigEndian.Uint64(payload[offset+5+uidLength:]), TxBytes: binary.BigEndian.Uint64(payload[offset+13+uidLength:]), LatencyMS: int64(binary.BigEndian.Uint64(payload[offset+21+uidLength:]))})
+		offset += 29 + uidLength
 	}
 	if offset != len(payload) {
 		return nil, ErrProtocol

@@ -373,6 +373,10 @@ func (r *Runtime) Join(ctx context.Context, options JoinOptions) (JoinResult, er
 	if err != nil {
 		return JoinResult{}, err
 	}
+	config, err := r.store.Load()
+	if err != nil {
+		return JoinResult{}, err
+	}
 	identity, err := device.LoadOrCreate(filepath.Join(r.dataDir, "client-"+invitation.HostUID+".secret"), options.FixedDeviceKey)
 	if err != nil {
 		return JoinResult{}, err
@@ -445,13 +449,13 @@ func (r *Runtime) Join(ctx context.Context, options JoinOptions) (JoinResult, er
 	}
 	for {
 		if usingMembership {
-			paired, control, err = pairing.ReconnectWithConfiguredSession(joinContext, address, memberPSK, identity.Public, options.Name, configure)
+			paired, control, err = pairing.ReconnectWithUIDSession(joinContext, address, memberPSK, identity.Public, config.Network.Node, options.Name, configure)
 			if errors.Is(err, pairing.ErrAuthFailed) {
 				usingMembership = false
 				continue
 			}
 		} else {
-			paired, control, err = pairing.PairWithSession(joinContext, address, pairing.RoomKey(invitation.RoomKey), identity.Public, options.Name, configure)
+			paired, control, err = pairing.PairWithUIDSession(joinContext, address, pairing.RoomKey(invitation.RoomKey), identity.Public, config.Network.Node, options.Name, configure)
 		}
 		if configured || terminalPairError(err) || joinContext.Err() != nil {
 			break
@@ -480,10 +484,6 @@ func (r *Runtime) Join(ctx context.Context, options JoinOptions) (JoinResult, er
 		if err := secret.Save(membershipPath, memberPSK[:]); err != nil {
 			return JoinResult{}, err
 		}
-	}
-	config, err := r.store.Load()
-	if err != nil {
-		return JoinResult{}, err
 	}
 	fmt.Fprintln(os.Stderr, "join: control session ready")
 	controlContext, cancelControl := context.WithCancel(context.Background())
@@ -561,7 +561,7 @@ func (r *Runtime) Leave() error {
 }
 
 func (r *Runtime) syncDevices(ctx context.Context, address string, memberPSK [32]byte, publicKey [32]byte, name, uid string, session *pairing.Session) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		var rx, tx uint64
@@ -588,13 +588,17 @@ func (r *Runtime) syncDevices(ctx context.Context, address string, memberPSK [32
 			if ctx.Err() != nil {
 				return
 			}
+			if errors.Is(err, pairing.ErrMemberDisabled) {
+				_ = r.Leave()
+				return
+			}
 			r.setLifecycle("joining")
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
-			_, next, pairErr := pairing.ReconnectWithSession(ctx, address, memberPSK, publicKey, name)
+			_, next, pairErr := pairing.ReconnectWithUIDSession(ctx, address, memberPSK, publicKey, uid, name, nil)
 			if pairErr != nil {
 				r.mu.Lock()
 				r.joinError = pairErr.Error()

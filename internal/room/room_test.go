@@ -228,7 +228,7 @@ func TestFixedHostKeyDoesNotFixTemporaryRoomKey(t *testing.T) {
 	}
 }
 
-func TestRemovedMemberIsBlockedAndIPIsReclaimed(t *testing.T) {
+func TestRemoveAllowsRejoinAndUIDBlacklistPersists(t *testing.T) {
 	directory := t.TempDir()
 	port := freePort(t)
 	service, _ := New(Options{DataDir: directory})
@@ -239,9 +239,17 @@ func TestRemovedMemberIsBlockedAndIPIsReclaimed(t *testing.T) {
 	code, _ := service.GetInvite()
 	decoded, _ := invite.Decode(code)
 	firstKey := sha256.Sum256([]byte("removed-client"))
+	uid := "1111111111111111"
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	_, err = pairing.Pair(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), firstKey, "removed")
+	_, control, err := pairing.PairWithUIDSession(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), firstKey, uid, "removed", nil)
 	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	_, err = control.Sync(ctx, pairing.StatsReport{UID: uid})
+	cancel()
+	control.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,17 +257,30 @@ func TestRemovedMemberIsBlockedAndIPIsReclaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	_, err = pairing.Pair(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), firstKey, "removed")
+	_, control, err = pairing.PairWithUIDSession(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), firstKey, uid, "removed", nil)
+	cancel()
+	if err != nil {
+		t.Fatalf("removed member could not rejoin: %v", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	_, err = control.Sync(ctx, pairing.StatsReport{UID: uid})
+	cancel()
+	control.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.BlockMember(base64.StdEncoding.EncodeToString(firstKey[:])); err != nil {
+		t.Fatal(err)
+	}
+	if !service.blockedUIDs[uid] {
+		t.Fatal("UID was not blacklisted")
+	}
+	secondKey := sha256.Sum256([]byte("same-user-new-device"))
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	_, _, err = pairing.PairWithUIDSession(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), secondKey, uid, "replacement", nil)
 	cancel()
 	if !errors.Is(err, pairing.ErrMemberDisabled) {
-		t.Fatalf("removed member rejoined: %v", err)
-	}
-	secondKey := sha256.Sum256([]byte("replacement-client"))
-	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	result, err := pairing.Pair(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), secondKey, "replacement")
-	cancel()
-	if err != nil || result.AssignedIP.String() != "10.0.23.2" {
-		t.Fatalf("IP was not reclaimed: %#v, %v", result, err)
+		t.Fatalf("blacklisted UID joined with a new key: %v", err)
 	}
 	if err := service.Stop(); err != nil {
 		t.Fatal(err)
@@ -269,11 +290,17 @@ func TestRemovedMemberIsBlockedAndIPIsReclaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.Stop()
+	if !restarted.blockedUIDs[uid] {
+		t.Fatal("blacklist did not survive restart")
+	}
+	if _, err := restarted.UnblockUID(uid); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	_, err = pairing.Pair(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), firstKey, "removed")
+	result, _, err := pairing.PairWithUIDSession(ctx, net.JoinHostPort("127.0.0.1", portString(port)), pairing.RoomKey(decoded.RoomKey), secondKey, uid, "replacement", nil)
 	cancel()
-	if !errors.Is(err, pairing.ErrMemberDisabled) {
-		t.Fatalf("block did not survive restart: %v", err)
+	if err != nil || result.AssignedIP.String() != "10.0.23.2" {
+		t.Fatalf("unblocked UID could not join: %#v, %v", result, err)
 	}
 }
 

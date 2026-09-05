@@ -162,13 +162,13 @@ func TestDeviceSyncReconnectsWithMemberPSK(t *testing.T) {
 	select {
 	case report := <-reports:
 		elapsed := time.Since(started)
-		if elapsed < 4500*time.Millisecond || elapsed > 7*time.Second {
-			t.Fatalf("reconnect report after %v, want about 5s", elapsed)
+		if elapsed < 500*time.Millisecond || elapsed > 2*time.Second {
+			t.Fatalf("reconnect report after %v, want about 1s", elapsed)
 		}
 		if report.UID != "0123456789abcdef" || report.VirtualIP != "10.0.23.2" {
 			t.Fatalf("unexpected reconnect report: %#v", report)
 		}
-	case <-time.After(7 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("device control session did not reconnect")
 	}
 	deadline := time.Now().Add(time.Second)

@@ -114,6 +114,7 @@ func TestTCPStatsAndDeviceSnapshot(t *testing.T) {
 	server, err := Listen("127.0.0.1:0", ServerConfig{
 		RoomKey: roomKey, HostPublicKey: hostKey, WireGuardPort: 25674, DiscoveryRelayPort: 25675,
 		JoinEnabled: func() bool { return true },
+		HostDevice:  Device{UID: "0000000000000000", VirtualIP: "10.0.23.1"},
 		Assign: func(key [32]byte, _ string, _ RoomKey, _ bool) (Assignment, error) {
 			if key == firstKey {
 				return Assignment{IP: netip.MustParseAddr("10.0.23.2"), Revision: 1}, nil
@@ -144,10 +145,10 @@ func TestTCPStatsAndDeviceSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	devices, err := first.Sync(ctx, StatsReport{UID: "1111111111111111", RxBytes: 50, TxBytes: 60})
-	if err != nil || len(devices) != 2 {
+	if err != nil || len(devices) != 3 {
 		t.Fatalf("device sync failed: %#v, %v", devices, err)
 	}
-	if devices[0] != (Device{UID: "1111111111111111", VirtualIP: "10.0.23.2", RxBytes: 50, TxBytes: 60}) || devices[1] != (Device{UID: "2222222222222222", VirtualIP: "10.0.23.3", RxBytes: 30, TxBytes: 40}) {
+	if devices[0].UID != "0000000000000000" || devices[0].VirtualIP != "10.0.23.1" || devices[1].UID != "1111111111111111" || devices[2].UID != "2222222222222222" {
 		t.Fatalf("wrong device snapshot: %#v", devices)
 	}
 	_, replacement, err := PairWithSession(ctx, server.Addr().String(), roomKey, secondKey, "second", nil)
@@ -159,17 +160,62 @@ func TestTCPStatsAndDeviceSnapshot(t *testing.T) {
 	}
 	_ = second.Close()
 	devices, err = first.Sync(ctx, StatsReport{UID: "1111111111111111", RxBytes: 50, TxBytes: 60})
-	if err != nil || len(devices) != 2 || devices[1].RxBytes != 70 {
+	if err != nil || len(devices) != 3 || devices[2].RxBytes != 70 {
 		t.Fatalf("replacement session was removed by stale disconnect: %#v, %v", devices, err)
 	}
 	_ = replacement.Close()
 	deadline := time.Now().Add(time.Second)
-	for len(devices) != 1 && time.Now().Before(deadline) {
+	for len(devices) != 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 		devices, err = first.Sync(ctx, StatsReport{UID: "1111111111111111", RxBytes: 50, TxBytes: 60})
 	}
-	if err != nil || len(devices) != 1 {
+	if err != nil || len(devices) != 2 {
 		t.Fatalf("disconnected device remained online: %#v, %v", devices, err)
+	}
+}
+
+func TestRemovedMemberReceivesDisabledStatus(t *testing.T) {
+	roomKey := roomKeyForTest()
+	clientKey := sha256.Sum256([]byte("removed"))
+	server, err := Listen("127.0.0.1:0", ServerConfig{
+		RoomKey: roomKey, HostPublicKey: sha256.Sum256([]byte("host")),
+		WireGuardPort: 1, DiscoveryRelayPort: 2, JoinEnabled: func() bool { return true },
+		Assign: func([32]byte, string, RoomKey, bool) (Assignment, error) {
+			return Assignment{IP: netip.MustParseAddr("10.0.23.2"), Revision: 1}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, session, err := PairWithSession(ctx, server.Addr().String(), roomKey, clientKey, "player", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = session.Sync(ctx, StatsReport{UID: "1111111111111111"}); err != nil {
+		t.Fatal(err)
+	}
+	server.RemoveMember(clientKey)
+	if _, err = session.Sync(ctx, StatsReport{UID: "1111111111111111"}); !errors.Is(err, ErrMemberDisabled) {
+		t.Fatalf("removed control session got %v", err)
+	}
+}
+
+func TestTCPStatusTimestampAndLatencyRoundTrip(t *testing.T) {
+	report := StatsReport{UID: "1111111111111111", RxBytes: 1, TxBytes: 2, TimestampMS: 1234}
+	payload, err := marshalStatsReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedReport, err := parseStatsReport(payload)
+	if err != nil || parsedReport != report {
+		t.Fatalf("stats timestamp round trip: %#v, %v", parsedReport, err)
+	}
+	devices, err := parseDevices(marshalDevices([]Device{{UID: report.UID, VirtualIP: "10.0.23.2", LatencyMS: 37}}))
+	if err != nil || len(devices) != 1 || devices[0].LatencyMS != 37 {
+		t.Fatalf("device latency round trip: %#v, %v", devices, err)
 	}
 }
 

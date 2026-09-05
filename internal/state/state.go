@@ -35,6 +35,7 @@ type Room struct {
 	JoinEnabled    bool     `json:"joinEnabled"`
 	Members        []Member `json:"members"`
 	BlockedMembers []string `json:"blockedMembers,omitempty"`
+	BlockedUIDs    []string `json:"blockedUids,omitempty"`
 }
 
 func Load(path string) (Room, error) {
@@ -114,6 +115,14 @@ func validate(value Room) error {
 			return ErrInvalid
 		}
 		keys[encoded] = true
+	}
+	blockedUIDs := make(map[string]bool, len(value.BlockedUIDs))
+	for _, blockedUID := range value.BlockedUIDs {
+		decoded, decodeErr := hex.DecodeString(blockedUID)
+		if decodeErr != nil || len(decoded) != 8 || hex.EncodeToString(decoded) != blockedUID || blockedUID == value.HostUID || blockedUIDs[blockedUID] {
+			return ErrInvalid
+		}
+		blockedUIDs[blockedUID] = true
 	}
 	return nil
 }

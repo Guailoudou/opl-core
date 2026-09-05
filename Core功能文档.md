@@ -224,7 +224,7 @@ Core 启动后首先输出：
     "wireguard-hot-update",
     "invite-v2",
     "pairing-v2",
-    "pairing-tcp-sync-v1",
+    "pairing-tcp-sync-v2",
     "room-v1",
     "fixed-secret",
     "lease-v1",

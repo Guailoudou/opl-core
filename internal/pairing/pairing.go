@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	ProtocolVersion byte = 1
+	ProtocolVersion byte = 2
 	MaxNameBytes         = 64
+	MaxUIDBytes          = 31
 	MaxFrameBytes        = 16384
 
 	FrameServerChallenge byte = 1
@@ -81,22 +82,23 @@ func ParseServerChallenge(b []byte) (ServerChallenge, error) {
 type ClientRequest struct {
 	ClientNonce     [32]byte
 	ClientPublicKey [32]byte
+	UID             string
 	Name            string
 	MAC             [32]byte
 }
 
 func NewClientRequest(challenge ServerChallenge, clientPublicKey [32]byte, name string, roomKey RoomKey, random io.Reader) (ClientRequest, error) {
-	return newClientRequest(challenge, clientPublicKey, name, roomKey[:], random)
+	return newClientRequest(challenge, clientPublicKey, "", name, roomKey[:], random)
 }
 
-func newClientRequest(challenge ServerChallenge, clientPublicKey [32]byte, name string, authKey []byte, random io.Reader) (ClientRequest, error) {
-	if !validName(name) || !validAuthKey(authKey) || isZero(clientPublicKey[:]) || challenge.Version != ProtocolVersion || isZero(challenge.HostPublicKey[:]) {
+func newClientRequest(challenge ServerChallenge, clientPublicKey [32]byte, uid, name string, authKey []byte, random io.Reader) (ClientRequest, error) {
+	if (uid != "" && !validUID(uid)) || !validName(name) || !validAuthKey(authKey) || isZero(clientPublicKey[:]) || challenge.Version != ProtocolVersion || isZero(challenge.HostPublicKey[:]) {
 		return ClientRequest{}, ErrProtocol
 	}
 	if random == nil {
 		random = cryptorand.Reader
 	}
-	v := ClientRequest{ClientPublicKey: clientPublicKey, Name: name}
+	v := ClientRequest{ClientPublicKey: clientPublicKey, UID: uid, Name: name}
 	if _, err := io.ReadFull(random, v.ClientNonce[:]); err != nil {
 		return ClientRequest{}, err
 	}
@@ -105,32 +107,38 @@ func newClientRequest(challenge ServerChallenge, clientPublicKey [32]byte, name 
 }
 
 func (v ClientRequest) MarshalBinary() ([]byte, error) {
-	if !validName(v.Name) || isZero(v.ClientPublicKey[:]) {
+	if (v.UID != "" && !validUID(v.UID)) || !validName(v.Name) || isZero(v.ClientPublicKey[:]) {
 		return nil, ErrProtocol
 	}
-	name := []byte(v.Name)
-	b := make([]byte, 97+len(name))
+	uid, name := []byte(v.UID), []byte(v.Name)
+	b := make([]byte, 98+len(uid)+len(name))
 	copy(b[:32], v.ClientNonce[:])
 	copy(b[32:64], v.ClientPublicKey[:])
-	b[64] = byte(len(name))
-	copy(b[65:65+len(name)], name)
-	copy(b[65+len(name):], v.MAC[:])
+	b[64] = byte(len(uid))
+	copy(b[65:], uid)
+	b[65+len(uid)] = byte(len(name))
+	copy(b[66+len(uid):], name)
+	copy(b[66+len(uid)+len(name):], v.MAC[:])
 	return b, nil
 }
 
 func ParseClientRequest(b []byte) (ClientRequest, error) {
-	if len(b) < 97 {
+	if len(b) < 98 {
 		return ClientRequest{}, ErrProtocol
 	}
-	nameLength := int(b[64])
-	if nameLength > MaxNameBytes || len(b) != 97+nameLength {
+	uidLength := int(b[64])
+	if uidLength > MaxUIDBytes || len(b) < 98+uidLength {
 		return ClientRequest{}, ErrProtocol
 	}
-	v := ClientRequest{Name: string(b[65 : 65+nameLength])}
+	nameLength := int(b[65+uidLength])
+	if nameLength > MaxNameBytes || len(b) != 98+uidLength+nameLength {
+		return ClientRequest{}, ErrProtocol
+	}
+	v := ClientRequest{UID: string(b[65 : 65+uidLength]), Name: string(b[66+uidLength : 66+uidLength+nameLength])}
 	copy(v.ClientNonce[:], b[:32])
 	copy(v.ClientPublicKey[:], b[32:64])
-	copy(v.MAC[:], b[65+nameLength:])
-	if !validName(v.Name) || isZero(v.ClientPublicKey[:]) {
+	copy(v.MAC[:], b[66+uidLength+nameLength:])
+	if (v.UID != "" && !validUID(v.UID)) || !validName(v.Name) || isZero(v.ClientPublicKey[:]) {
 		return ClientRequest{}, ErrProtocol
 	}
 	return v, nil
@@ -141,7 +149,7 @@ func VerifyClientRequest(challenge ServerChallenge, request ClientRequest, roomK
 }
 
 func verifyClientRequest(challenge ServerChallenge, request ClientRequest, authKey []byte) bool {
-	if challenge.Version != ProtocolVersion || isZero(challenge.HostPublicKey[:]) || isZero(request.ClientPublicKey[:]) || !validAuthKey(authKey) || !validName(request.Name) {
+	if challenge.Version != ProtocolVersion || isZero(challenge.HostPublicKey[:]) || isZero(request.ClientPublicKey[:]) || (request.UID != "" && !validUID(request.UID)) || !validAuthKey(authKey) || !validName(request.Name) {
 		return false
 	}
 	expected := requestMAC(challenge, request, authKey)
@@ -156,6 +164,8 @@ func requestMAC(challenge ServerChallenge, request ClientRequest, authKey []byte
 	h.Write(request.ClientNonce[:])
 	h.Write(challenge.HostPublicKey[:])
 	h.Write(request.ClientPublicKey[:])
+	h.Write([]byte{byte(len([]byte(request.UID)))})
+	h.Write([]byte(request.UID))
 	h.Write([]byte{byte(len([]byte(request.Name)))})
 	h.Write([]byte(request.Name))
 	return sum32(h.Sum(nil))
