@@ -27,7 +27,7 @@ $env:CGO_ENABLED = '0'
 $env:GOCACHE = Join-Path $coreRoot '.gocache'
 Push-Location $coreRoot
 try {
-    & go build -mod=vendor -trimpath -ldflags '-s -w' -o (Join-Path $dist 'opl-core.exe') ./cmd/opl-core
+    & go build -mod=readonly -trimpath -ldflags '-s -w' -o (Join-Path $dist 'opl-core.exe') ./cmd/opl-core
     if ($LASTEXITCODE -ne 0) { throw "go build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location

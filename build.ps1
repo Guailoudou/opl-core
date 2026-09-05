@@ -56,7 +56,7 @@ try {
         $env:CGO_ENABLED = '0'
         $env:GOCACHE = Join-Path $coreRoot '.gocache'
 
-        & go build -mod=vendor -trimpath -ldflags '-s -w' -o (Join-Path $output "opl-core$($item.Ext)") ./cmd/opl-core
+        & go build -mod=readonly -trimpath -ldflags '-s -w' -o (Join-Path $output "opl-core$($item.Ext)") ./cmd/opl-core
         if ($LASTEXITCODE -ne 0) { throw "Build failed: $($item.Label)" }
 
         Copy-Item -LiteralPath (Join-Path $coreRoot 'web') -Destination $output -Recurse -Force

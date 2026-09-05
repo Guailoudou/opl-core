@@ -50,8 +50,8 @@ Android 与 OpenHarmony 与 OpenP2P 原项目相同：TUN 必须由 VPNService/V
 必须使用 Go 1.20.14：
 
 ```text
-go test -mod=vendor ./...
-go build -mod=vendor ./cmd/opl-core
+go test -mod=readonly ./...
+go build -mod=readonly ./cmd/opl-core
 ```
 
 不得升级到 Go 1.21+，否则失去 Windows 7/8 兼容基线。首发仍可只发布 `windows-386`，Action 同时验证和生成其他 OpenP2P 已发布的平台制品。
